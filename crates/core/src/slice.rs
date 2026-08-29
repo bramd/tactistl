@@ -12,9 +12,29 @@ pub struct Segment {
 
 /// Intersect the rotated mesh with the plane z = `z`, returning a segment soup.
 ///
-/// Vertices lying exactly on the plane are classified as being above it. That
-/// keeps the above/below split consistent, so a crossing triangle always has
-/// exactly two crossing edges and never degenerates into a single point.
+/// Vertices lying exactly on the plane are classified as being *above* it,
+/// which keeps the above/below split consistent. The invariant that makes the
+/// rest of the function correct is less obvious, so spelling it out:
+///
+/// Past the all-above/all-below early return, the number of crossing edges is
+/// **always exactly two**. `above` is three booleans read around a cycle, and
+/// the number of transitions around any cycle is necessarily even — so the
+/// count can be 0 or 2 but never 1. It is 0 only when all three agree, which
+/// the early return has already skipped. This holds for *any* coordinates,
+/// NaN included, since `NaN >= z` is simply false and still a boolean.
+///
+/// Two consequences worth knowing:
+///
+/// - A triangle with one vertex exactly on the plane and the other two below
+///   produces a **zero-length** segment, not a dropped one: both crossing
+///   edges meet at that on-plane vertex, so both hits are the same point.
+///   Harmless — outline mode draws it as a single dot, and a scanline fill
+///   sees a zero-height span and contributes nothing.
+/// - A triangle lying fully in the plane classifies as all-above and is
+///   skipped entirely. So slicing exactly at a model's maximum Z still yields
+///   an outline (supplied by the neighbouring triangles below it), whereas
+///   slicing exactly at its minimum Z yields nothing at all. Callers choosing
+///   a slice height are expected to stay inside the open range.
 pub fn slice(mesh: &Mesh, rotation_deg: Vec3, view: ViewAxis, z: f32) -> Vec<Segment> {
     let m = total_matrix(rotation_deg, view);
     let mut out = Vec::new();
@@ -30,6 +50,10 @@ pub fn slice(mesh: &Mesh, rotation_deg: Vec3, view: ViewAxis, z: f32) -> Vec<Seg
         }
 
         // Exactly two edges cross: those joining a vertex above to one below.
+        // The `n` bounds checks below are defensive only — by the parity
+        // argument in the doc comment `n` provably ends at 2 — but they are
+        // kept so a future change to the classification cannot turn an
+        // overrun into a panic or a silent out-of-range write.
         let mut hits = [Vec2::default(); 2];
         let mut n = 0;
         for i in 0..3 {

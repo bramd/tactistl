@@ -22,6 +22,13 @@ pub enum ParseError {
     },
     /// Parsed successfully but contains no triangles.
     NoGeometry,
+    /// A coordinate was NaN or an infinity. A binary STL can carry these
+    /// legally, and they poison everything downstream: an infinity wrecks the
+    /// framing box, while a NaN slips through `bounds()` unnoticed — `f32::min`
+    /// and `f32::max` ignore a NaN operand — and only resurfaces as NaN
+    /// cross-section coordinates, i.e. a blank or garbage tactile frame with no
+    /// error to explain it.
+    NonFinite,
 }
 
 impl ParseError {
@@ -43,6 +50,7 @@ impl std::fmt::Display for ParseError {
                 _ => write!(f, "this STL file could not be read"),
             },
             ParseError::NoGeometry => write!(f, "the file contains no triangles"),
+            ParseError::NonFinite => write!(f, "this STL contains invalid coordinates"),
         }
     }
 }
@@ -127,7 +135,17 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
             let p = tri.vertices[i];
             Vec3::new(p[0], p[1], p[2])
         };
-        triangles.push(Triangle { v: [v(0), v(1), v(2)] });
+        let t = Triangle { v: [v(0), v(1), v(2)] };
+        // Reject the whole file rather than skipping the offending triangles:
+        // silently dropped geometry is worse than a clear refusal for a tool
+        // whose purpose is trusting the output as a reading of the model.
+        // Only the vertices are checked; `Triangle` does not keep the facet
+        // normal, so a garbage normal cannot reach any downstream maths, and
+        // real exporters do write junk there.
+        if t.v.iter().any(|p| !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite())) {
+            return Err(ParseError::NonFinite);
+        }
+        triangles.push(t);
     }
 
     if triangles.is_empty() {
@@ -221,5 +239,70 @@ mod tests {
         assert_eq!(mesh.triangles.len(), 12);
         assert_eq!(mesh.bounds().min, Vec3::new(-1.0, -1.0, -1.0));
         assert_eq!(mesh.bounds().max, Vec3::new(1.0, 1.0, 1.0));
+    }
+
+    /// Overwrite one f32 of the binary fixture at `offset` with `v`.
+    ///
+    /// Binary STL layout: an 80-byte header, a u32 count, then 50 bytes per
+    /// triangle (a 3-float normal, three 3-float vertices, a u16 attribute).
+    fn poke_float(offset: usize, v: f32) -> Vec<u8> {
+        let mut b = BINARY_CUBE.to_vec();
+        b[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
+        b
+    }
+
+    /// The X of the first triangle's first vertex: 80 + 4 + 12.
+    const FIRST_VERTEX_X: usize = 96;
+    /// The Z of the last triangle's last vertex: 84 + 50*11 + 12 + 24 + 8.
+    const LAST_VERTEX_Z: usize = 678;
+
+    /// A binary STL can legally carry NaN in its f32 coordinates. Left alone,
+    /// NaN is *invisible* downstream: `bounds()` uses `f32::min`/`max`, which
+    /// ignore a NaN operand, so the framing box still looks perfectly ordinary
+    /// while the geometry it frames is garbage. The user would get a blank or
+    /// nonsense tactile frame and no error at all. Refuse the file instead.
+    #[test]
+    fn rejects_nan_coordinate() {
+        let err = parse_stl(&poke_float(FIRST_VERTEX_X, f32::NAN)).unwrap_err();
+        assert!(matches!(err, ParseError::NonFinite), "got {err:?}");
+    }
+
+    /// As above for an infinity, which poisons the bounds outright. Poking the
+    /// *last* vertex's Z also pins that every vertex and every component is
+    /// checked, not just the first one.
+    #[test]
+    fn rejects_infinite_coordinate() {
+        let err = parse_stl(&poke_float(LAST_VERTEX_Z, f32::INFINITY)).unwrap_err();
+        assert!(matches!(err, ParseError::NonFinite), "got {err:?}");
+        let err = parse_stl(&poke_float(LAST_VERTEX_Z, f32::NEG_INFINITY)).unwrap_err();
+        assert!(matches!(err, ParseError::NonFinite), "got {err:?}");
+    }
+
+    /// The whole file is refused rather than the bad triangles being skipped:
+    /// silently dropped geometry is worse than a clear refusal for a tool whose
+    /// entire purpose is trusting the output as an accurate reading.
+    #[test]
+    fn a_single_bad_coordinate_rejects_the_whole_file() {
+        assert!(parse_stl(&poke_float(LAST_VERTEX_Z, f32::NAN)).is_err());
+    }
+
+    /// This string is read aloud to a blind user by a screen reader, so it must
+    /// carry no float jargon.
+    #[test]
+    fn non_finite_message_is_human_readable() {
+        let err = parse_stl(&poke_float(FIRST_VERTEX_X, f32::NAN)).unwrap_err();
+        let msg = err.to_string();
+        for jargon in ["NaN", "nan", "inf", "finite"] {
+            assert!(!msg.contains(jargon), "leaked jargon {jargon:?}: {msg}");
+        }
+        assert!(msg.contains("STL"), "unhelpful message: {msg}");
+    }
+
+    /// Regression: poking a float must not itself break the fixture, so the
+    /// same helper writing a *finite* value still parses.
+    #[test]
+    fn poking_a_finite_value_still_parses() {
+        let mesh = parse_stl(&poke_float(FIRST_VERTEX_X, 0.5)).unwrap();
+        assert_eq!(mesh.triangles.len(), 12);
     }
 }
