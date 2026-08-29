@@ -298,6 +298,37 @@ mod tests {
         assert!(msg.contains("STL"), "unhelpful message: {msg}");
     }
 
+    /// The other non-finite tests all poke the *binary* fixture. An ASCII STL
+    /// can carry a `nan` token too, and it is not obvious whether `stl_io`'s
+    /// ASCII reader parses it into a float (so our own guard catches it) or
+    /// rejects the token first. Empirically it is the latter: the reader
+    /// refuses the token with `InvalidData`, so the file surfaces as
+    /// `Malformed`, never reaching the `NonFinite` guard. That is fine — both
+    /// are a clear refusal — but it means the `NonFinite` path is binary-only,
+    /// and this test is what would notice if a future `stl_io` relaxed the
+    /// token check and started letting NaN through.
+    #[test]
+    fn rejects_nan_coordinate_in_ascii_stl() {
+        let src = "solid nan\n\
+                   facet normal 0 0 1\n\
+                   outer loop\n\
+                   vertex nan 0 0\n\
+                   vertex 1 0 0\n\
+                   vertex 0 1 0\n\
+                   endloop\n\
+                   endfacet\n\
+                   endsolid nan\n";
+        let err = parse_stl(src.as_bytes()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::Malformed { kind: std::io::ErrorKind::InvalidData, .. }
+                    | ParseError::NonFinite
+            ),
+            "a NaN coordinate must be refused, got {err:?}"
+        );
+    }
+
     /// Regression: poking a float must not itself break the fixture, so the
     /// same helper writing a *finite* value still parses.
     #[test]

@@ -93,6 +93,21 @@ mod tests {
         parse_stl(include_bytes!("../tests/fixtures/cube_ascii.stl")).unwrap()
     }
 
+    /// The cube fixture stretched to distinct extents on every axis, so a
+    /// cross-section identifies which view produced it. The symmetric cube
+    /// cannot: every view of it looks the same.
+    fn brick() -> crate::mesh::Mesh {
+        let mut m = cube();
+        for t in &mut m.triangles {
+            for v in &mut t.v {
+                v.x *= 1.0; // half-extent 1
+                v.y *= 2.0; // half-extent 2
+                v.z *= 3.0; // half-extent 3
+            }
+        }
+        m
+    }
+
     /// Extent of the segment soup along each axis.
     fn extent(segs: &[Segment]) -> (f32, f32, f32, f32) {
         let mut min_x = f32::INFINITY;
@@ -110,6 +125,11 @@ mod tests {
         (min_x, max_x, min_y, max_y)
     }
 
+    /// Only sound as a pair with
+    /// `every_crossing_triangle_yields_exactly_one_segment`: this test pins the
+    /// outline's coordinates but not how many segments trace it, so an
+    /// implementation emitting duplicates over the same outline still passes.
+    /// Do not delete either.
     #[test]
     fn slicing_a_cube_mid_height_gives_its_square_cross_section() {
         let segs = slice(&cube(), Vec3::default(), ViewAxis::Top, 0.0);
@@ -133,6 +153,10 @@ mod tests {
         assert!(segs.is_empty());
     }
 
+    /// Only sound as a pair with
+    /// `slicing_a_cube_mid_height_gives_its_square_cross_section`: a count
+    /// alone would still pass for an implementation emitting 8 segments with
+    /// entirely wrong coordinates. That test pins the coordinates.
     #[test]
     fn every_crossing_triangle_yields_exactly_one_segment() {
         // A cube sliced mid-height crosses 8 of its 12 triangles: the 4 side
@@ -146,7 +170,11 @@ mod tests {
         // z = 1.0 is the cube's top face: every vertex of the top triangles
         // lies exactly on the plane. This must not produce garbage.
         let segs = slice(&cube(), Vec3::default(), ViewAxis::Top, 1.0);
-        // Either empty or a valid outline; the requirement is that it returns.
+        // Not merely "it returns": the outline must still be there. Each of the
+        // 8 side-face triangles has vertices at z = 1 (classified above) and at
+        // z = -1 (below), so all 8 cross. The top face's own triangles are all
+        // on the plane, hence all-above, and are skipped.
+        assert_eq!(segs.len(), 8);
         for s in &segs {
             assert!(s.a.x.is_finite() && s.a.y.is_finite());
             assert!(s.b.x.is_finite() && s.b.y.is_finite());
@@ -161,5 +189,38 @@ mod tests {
         assert!(!segs.is_empty());
         let segs = slice(&cube(), Vec3::default(), ViewAxis::Front, 5.0);
         assert!(segs.is_empty());
+    }
+
+    /// The `view` argument must actually reach the transform. The symmetric
+    /// cube cannot show that — every view of it yields the same square — so
+    /// slice the asymmetric brick (half-extents X=1, Y=2, Z=3) and pin the
+    /// cross-section's world-XY extents, which differ per view:
+    ///
+    /// - `Top` is the identity: world X <- model X (1), world Y <- model Y (2).
+    /// - `Front` is Rx(-90): model +X -> +X, +Y -> -Z, +Z -> +Y. So world
+    ///   X <- model X (1), world Y <- model Z (3); the slice axis is model Y.
+    /// - `Side` is Rx(-90)*Rz(90): model +X -> -Z, +Y -> -X, +Z -> +Y. So
+    ///   world X <- model -Y (2), world Y <- model Z (3); slice axis model X.
+    #[test]
+    fn each_view_gives_its_own_cross_section() {
+        let expected = [
+            (ViewAxis::Top, 1.0, 2.0),
+            (ViewAxis::Front, 1.0, 3.0),
+            (ViewAxis::Side, 2.0, 3.0),
+        ];
+        for (view, hx, hy) in expected {
+            let segs = slice(&brick(), Vec3::default(), view, 0.0);
+            assert!(!segs.is_empty(), "{view:?} sliced to nothing");
+            let (min_x, max_x, min_y, max_y) = extent(&segs);
+            let got = (min_x, max_x, min_y, max_y);
+            let want = (-hx, hx, -hy, hy);
+            assert!(
+                (min_x + hx).abs() < 1e-4
+                    && (max_x - hx).abs() < 1e-4
+                    && (min_y + hy).abs() < 1e-4
+                    && (max_y - hy).abs() < 1e-4,
+                "{view:?}: expected {want:?}, got {got:?}"
+            );
+        }
     }
 }

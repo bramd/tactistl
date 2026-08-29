@@ -14,6 +14,9 @@ pub enum ViewAxis {
 }
 
 impl ViewAxis {
+    /// Deliberately lenient: any unrecognised value maps to `Top` rather than
+    /// failing, because this is an FFI boundary where a bad discriminant must
+    /// not become a panic or an error path the caller has to handle.
     pub fn from_u8(v: u8) -> ViewAxis {
         match v {
             1 => ViewAxis::Front,
@@ -113,6 +116,18 @@ mod tests {
         approx(m.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(0.0, 1.0, 0.0));
     }
 
+    /// A right-handed rotation about +Y takes +Z to +X (and +X to -Z), which is
+    /// the cyclic partner of `rotates_90_about_x` (+Y to +Z) and
+    /// `rotates_90_about_z` (+X to +Y). Nothing else in the crate exercises a
+    /// non-zero Y angle — no view preset uses one — so without this a
+    /// transposed `rot_y` would first surface under the user's Y slider.
+    #[test]
+    fn rotates_90_about_y() {
+        let m = euler_deg(0.0, 90.0, 0.0);
+        approx(m.apply(Vec3::new(0.0, 0.0, 1.0)), Vec3::new(1.0, 0.0, 0.0));
+        approx(m.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(0.0, 0.0, -1.0));
+    }
+
     #[test]
     fn euler_order_is_x_then_y_then_z() {
         // Applying X then Z to +Y: X(90) sends +Y to +Z; Z(90) leaves +Z alone.
@@ -120,6 +135,17 @@ mod tests {
         approx(m.apply(Vec3::new(0.0, 1.0, 0.0)), Vec3::new(0.0, 0.0, 1.0));
         // Applying X then Z to +X: X(90) leaves +X; Z(90) sends +X to +Y.
         approx(m.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(0.0, 1.0, 0.0));
+
+        // With Y zero the above still passes for Rz*Rx*Ry, so pin the full
+        // order with all three angles non-zero. Rz(90)*Ry(90)*Rx(90) walks
+        // +X -> (X leaves it) +X -> (Y) -Z -> (Z leaves it) -Z. Each of the
+        // five wrong orderings lands somewhere else: Rz*Rx*Ry -> (-1,0,0),
+        // Rx*Ry*Rz -> (0,0,1), Ry*Rx*Rz -> (1,0,0), Rx*Rz*Ry -> (0,1,0),
+        // Ry*Rz*Rx -> (0,1,0).
+        let m = euler_deg(90.0, 90.0, 90.0);
+        approx(m.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(0.0, 0.0, -1.0));
+        approx(m.apply(Vec3::new(0.0, 1.0, 0.0)), Vec3::new(0.0, 1.0, 0.0));
+        approx(m.apply(Vec3::new(0.0, 0.0, 1.0)), Vec3::new(1.0, 0.0, 0.0));
     }
 
     #[test]
@@ -185,13 +211,19 @@ mod tests {
         }
     }
 
+    /// R_total = R_view * R_user — the user's orientation is applied first.
+    ///
+    /// The case must be a *non-commuting* one. A user rotation of Rx(-90)
+    /// against the Front view (which is itself Rx(-90)) commutes, so no input
+    /// could tell the two composition orders apart.
     #[test]
     fn total_matrix_applies_user_rotation_before_view() {
-        // R_total = R_view * R_user. With a Front view and a user rotation that
-        // sends +Z to +Y, the composite must send +Z back onto the Z axis.
-        let total = total_matrix(Vec3::new(-90.0, 0.0, 0.0), ViewAxis::Front);
-        let out = total.apply(Vec3::new(0.0, 0.0, 1.0));
-        assert!(out.z.abs() > 0.99, "expected +Z on the slice axis, got {out:?}");
+        // R_user = Rz(90), R_view = Rx(-90). Correct order Rx(-90)*Rz(90)
+        // sends +X -> (Z) +Y -> (X) (0,0,-1). That is exactly the Side preset.
+        // The reversed order Rz(90)*Rx(-90) would send +X -> (X) +X -> (Z)
+        // (0,1,0) instead, so this rules that out.
+        let total = total_matrix(Vec3::new(0.0, 0.0, 90.0), ViewAxis::Front);
+        approx(total.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(0.0, 0.0, -1.0));
     }
 
     #[test]
