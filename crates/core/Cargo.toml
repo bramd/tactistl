@@ -1,0 +1,7 @@
+[package]
+name = "tactistl-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+stl_io = "0.11"
