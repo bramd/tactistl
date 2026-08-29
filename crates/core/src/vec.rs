@@ -26,6 +26,8 @@ impl Mat3 {
         Mat3([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
     }
 
+    // Indexing by range is clearer than `enumerate()` for a fixed 3x3 kernel.
+    #[allow(clippy::needless_range_loop)]
     pub fn mul(&self, other: &Mat3) -> Mat3 {
         let mut out = [[0.0f32; 3]; 3];
         for r in 0..3 {
@@ -72,5 +74,39 @@ impl Bbox3 {
 
     pub fn is_empty(&self) -> bool {
         self.min.x > self.max.x
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPS: f32 = 1e-6;
+
+    fn assert_close(a: Vec3, b: Vec3) {
+        assert!(
+            (a.x - b.x).abs() < EPS && (a.y - b.y).abs() < EPS && (a.z - b.z).abs() < EPS,
+            "{a:?} != {b:?}"
+        );
+    }
+
+    /// Pins both the row/column convention of `apply` and the handedness:
+    /// a right-handed 90 degree rotation about +Z takes +X to +Y.
+    #[test]
+    fn rotation_about_z_is_right_handed() {
+        let (s, c) = (std::f32::consts::FRAC_PI_2).sin_cos();
+        let rz = Mat3([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]);
+        assert_close(rz.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(0.0, 1.0, 0.0));
+    }
+
+    /// `mul` must compose in the same order `apply` is applied in.
+    #[test]
+    fn mul_composes_consistently_with_apply() {
+        let (s1, c1) = (0.7f32).sin_cos();
+        let a = Mat3([[c1, -s1, 0.0], [s1, c1, 0.0], [0.0, 0.0, 1.0]]);
+        let (s2, c2) = (-1.3f32).sin_cos();
+        let b = Mat3([[1.0, 0.0, 0.0], [0.0, c2, -s2], [0.0, s2, c2]]);
+        let v = Vec3::new(0.3, -2.0, 5.5);
+        assert_close(a.mul(&b).apply(v), a.apply(b.apply(v)));
     }
 }
