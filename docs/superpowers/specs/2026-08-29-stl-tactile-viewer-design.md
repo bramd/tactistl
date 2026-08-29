@@ -7,8 +7,8 @@ Date: 2026-08-29
 A browser-based tool for checking a 3D model's orientation by touch before
 slicing and printing. It loads an STL, applies a user-specified rotation,
 computes a cross-section, rasterizes it to the Dot Pad's tactile graphics
-grid, and pushes it to the device over Web Bluetooth. A scrubber moves the
-cross-section through the model so the shape can be felt end to end.
+grid, and pushes it to the device over USB serial or Bluetooth. A scrubber
+moves the cross-section through the model so the shape can be felt end to end.
 
 This is an orientation-check tool, not a slicer preview. No infill, supports,
 or G-code-accurate layer geometry.
@@ -19,7 +19,7 @@ The "render a raster to a tactile device" layer is kept cleanly separable so
 it can later be retargeted or mirrored into an NVDA-side tactile output path
 without a rewrite. Concretely: the geometry core emits a device-agnostic
 row-major bitmap, and everything Dot-specific (cell packing, hex encoding,
-BLE transport) lives behind a single TypeScript interface.
+and both transports) lives behind a single TypeScript interface.
 
 ## Confirmed device facts
 
@@ -81,7 +81,10 @@ Line 0 is a separate 20-cell braille text line, written with
 
 - `new DotPadScanner().startBleScan()` returns a `BluetoothDevice` (requires a
   user gesture; opens the browser's Bluetooth picker)
+- `new DotPadScanner().startUsbScan()` returns a `SerialPort` (also requires a
+  user gesture; opens the browser's serial-port picker)
 - `sdk.connectBleDevice(device)` returns a `DotDevice`
+- `sdk.connectUsbDevice(port)` returns a `DotDevice`, same semantics
 - `sdk.setCallBack(messageCb, keyCb, onKeyDown?, onKeyUp?)`
 - wait for `DataCodes.Connected` before sending anything
 - `sdk.displayGraphicData(hex, device, DisplayMode.GraphicMode)`
@@ -92,11 +95,30 @@ Line 0 is a separate 20-cell braille text line, written with
 The SDK ships as a vendored ES module (`DotPadSDK-3.0.2.js` plus its `.d.ts`);
 there is no npm package.
 
+### Transports: BLE and USB serial
+
+Both are supported from the first version. USB serial is the more performant
+link, so it is the preferred transport where a cable is available, and BLE is
+offered for untethered use.
+
+The two paths are symmetric in the SDK — scan, connect, and every display and
+callback API are identical once a `DotDevice` exists. So the transport choice
+is confined entirely to `DotPadSink`'s connect step; nothing downstream of it
+knows or cares which link is in use.
+
+`DotPadSink.connect(transport)` takes `"usb" | "ble"` and dispatches to
+`startUsbScan`/`connectUsbDevice` or `startBleScan`/`connectBleDevice`
+accordingly. Feature detection is per transport: `navigator.serial` for USB,
+`navigator.bluetooth` for BLE, each gating its own button independently so an
+environment supporting only one still offers that one.
+
 ### Browser support
 
-Chromium only (Chrome/Edge). Web Bluetooth is not implemented in Firefox or
-Safari. Everything except the connection step works in any browser; the README
-must say so.
+Chromium only (Chrome/Edge). Neither Web Serial nor Web Bluetooth is
+implemented in Firefox or Safari, so both connection paths are Chromium-gated.
+Everything except the connection step — STL parsing, slicing, rasterizing, the
+whole UI and the on-screen preview — works in any browser; the README must say
+so.
 
 ## Architecture
 
@@ -113,7 +135,7 @@ must say so.
       |
 +---------------------- TypeScript ---------------------------------+
 |  TactileSink interface                                            |
-|    +-- DotPadSink  (bitmap -> cell hex -> SDK -> BLE)             |
+|    +-- DotPadSink  (bitmap -> cell hex -> SDK -> USB/BLE)         |
 |    +-- (future) NvdaSink / CanvasPreviewSink                      |
 +-------------------------------------------------------------------+
       ^
@@ -125,7 +147,7 @@ must say so.
 
 ### Rust/WASM core
 
-Pure computation. No DOM, no Bluetooth, no UI. Exported interface:
+Pure computation. No DOM, no transport, no UI. Exported interface:
 
 ```
 parse_stl(bytes) -> MeshHandle
@@ -217,14 +239,20 @@ adjusted. Not worth researching the physical pitch up front.
 A `TactileSink` interface is the only thing the rest of the app talks to:
 
 ```
+type Transport = "usb" | "ble";
+
 interface TactileSink {
   readonly grid: { width: number; height: number };
+  readonly availableTransports: Transport[];
   renderFrame(bitmap: Bitmap): void;
   renderText(text: string): void;
-  connect(): Promise<void>;
+  connect(transport: Transport): Promise<void>;
   disconnect(): Promise<void>;
 }
 ```
+
+`availableTransports` is what the UI gates its connect buttons on. A sink with
+no transports at all (Firefox, Safari) still renders to the on-screen preview.
 
 `DotPadSink` implements it over the vendored SDK and owns everything
 Dot-specific: bitmap to cell hex packing (using the bit table above), the SDK
@@ -276,7 +304,7 @@ sources:
 - view axis select
 - mirror checkbox
 - scrubber (range input plus a numeric field for an exact value)
-- Dot Pad hardware keys via the SDK key callback
+- Dot Pad hardware keys via the SDK key callback (identical on both transports)
 
 Hardware `PanningLeft` / `PanningRight` map to scrub -1 / +1 step. Because they
 write to the same store, the on-screen slider stays in sync automatically —
@@ -289,6 +317,16 @@ The range covers the rotated model's extent along the current view axis, in
 100 steps. A separate numeric input accepts an exact value in mm. On load, and
 whenever the view axis changes, the position defaults to the **middle** of the
 extent, so the first read without touching anything is a sensible cross-section.
+
+#### Connection controls
+
+Two separate buttons, "Connect over USB" and "Connect over Bluetooth", rather
+than a transport dropdown feeding one button. Each is independently enabled by
+its own feature check, each opens its own browser picker directly from the
+click (both APIs require the user gesture), and the label states the outcome
+without a second control having to be read first. USB is listed first as the
+faster link. Once connected, both collapse to a single "Disconnect" button
+naming the active transport.
 
 #### Accessibility
 
@@ -311,8 +349,10 @@ for sighted collaborators and for development without hardware attached.
 | Unparseable STL | Error message in a live region; previous model retained |
 | Zero-triangle or degenerate mesh | Explicit "no geometry found" message |
 | Slice plane misses all geometry | Blank frame, not an error (legitimate at the extremes) |
-| Web Bluetooth unavailable | Connect button disabled with an explanatory message; rest of the app fully usable |
-| BLE connection lost mid-session | Disconnected event resets connection state; UI stays usable, frames stop being sent |
+| A transport's browser API unavailable | That transport's connect button is disabled with an explanatory message; the other remains offered; rest of the app fully usable |
+| Neither transport available | Both buttons disabled, on-screen preview still works |
+| User cancels the device picker | No-op, no error state (scan resolves undefined) |
+| Connection lost mid-session (either transport) | Disconnected event resets connection state; UI stays usable, frames stop being sent |
 | Very large STL | Parsing runs off the main thread; a busy state is announced |
 
 ## Testing
@@ -327,8 +367,14 @@ for sighted collaborators and for development without hardware attached.
   queue (submit N frames, assert only the first and last are sent).
 - **Store tests**: assert that a hardware-key scrub and an on-screen scrub
   produce identical state, which is the single-pipeline invariant.
+- **Transport tests** against a stubbed SDK: `connect("usb")` and
+  `connect("ble")` reach the correct scan/connect pair; a cancelled picker
+  leaves the sink disconnected without throwing; `availableTransports` reflects
+  `navigator.serial` / `navigator.bluetooth` presence independently.
 - **Manual hardware verification**: sphere at mid-height for the aspect-ratio
-  constant; a two-legged model to confirm disjoint regions render together.
+  constant; a two-legged model to confirm disjoint regions render together;
+  a scrub sweep over each transport in turn to confirm identical output and to
+  sanity-check the latest-wins queue under USB's higher throughput.
 
 ## Out of scope
 
@@ -336,4 +382,3 @@ for sighted collaborators and for development without hardware attached.
 - Slicer fidelity (supports, infill, accurate layer geometry)
 - NVDA output bridging (architecture accommodates it; not built)
 - Zoom and pan
-- USB serial connection (the SDK supports it; BLE only for v1)
