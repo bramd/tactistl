@@ -92,6 +92,10 @@ mod tests {
 
     /// Pins both the row/column convention of `apply` and the handedness:
     /// a right-handed 90 degree rotation about +Z takes +X to +Y.
+    ///
+    /// Only sound as a pair with `mul_composes_consistently_with_apply`: that
+    /// test still passes if `mul` and `apply` are both transposed, so this one
+    /// is what pins the convention. Do not delete either.
     #[test]
     fn rotation_about_z_is_right_handed() {
         let (s, c) = (std::f32::consts::FRAC_PI_2).sin_cos();
@@ -100,6 +104,9 @@ mod tests {
     }
 
     /// `mul` must compose in the same order `apply` is applied in.
+    ///
+    /// Only sound as a pair with `rotation_about_z_is_right_handed`: this test
+    /// alone still passes if `mul` and `apply` are both transposed.
     #[test]
     fn mul_composes_consistently_with_apply() {
         let (s1, c1) = (0.7f32).sin_cos();

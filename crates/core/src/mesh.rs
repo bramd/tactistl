@@ -98,9 +98,13 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
         } else {
             bytes
         }
-    } else if bytes.starts_with(b"solid") && bytes.get(5).is_none_or(|c| *c != b' ') {
+    } else if bytes.starts_with(b"solid") && matches!(bytes.get(5), None | Some(b'\n' | b'\r')) {
         // Workaround: an empty solid name (`solid\n`) is legal but fails the
-        // upstream probe, so insert the space it insists on.
+        // upstream probe, so insert the space it insists on. The guard
+        // requires a line terminator (or EOF) after `solid`, which is all a
+        // real ASCII STL can have there: a binary header such as "solidworks"
+        // must fall through untouched, since inserting a byte into binary data
+        // shifts every offset and can fabricate plausible-looking geometry.
         let mut b = Vec::with_capacity(bytes.len() + 1);
         b.extend_from_slice(b"solid ");
         b.extend_from_slice(&bytes[5..]);
@@ -113,6 +117,9 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
     let mut cursor = Cursor::new(bytes);
     let reader = stl_io::create_stl_reader(&mut cursor).map_err(ParseError::malformed)?;
 
+    // Deliberately not `with_capacity(size_hint())`: the triangle count is
+    // untrusted input, and pre-allocating from it is what made a malformed
+    // file abort the process trying to allocate ~103 GB.
     let mut triangles = Vec::new();
     for tri in reader {
         let tri = tri.map_err(ParseError::malformed)?;
@@ -198,5 +205,21 @@ mod tests {
         let msg = err.to_string();
         assert!(!msg.contains("buffer"), "leaked io::Error detail: {msg}");
         assert!(msg.contains("STL"), "unhelpful message: {msg}");
+    }
+
+    /// A binary STL with trailing padding fails the exact-length check, so it
+    /// reaches the ASCII branch. Its 80-byte header may well start with the
+    /// letters `solid` (e.g. "solidworks"); we must not treat that as ASCII
+    /// and shift every byte by one, which would invent plausible-looking
+    /// geometry from a file we cannot actually read.
+    #[test]
+    fn parses_padded_binary_stl_with_solidworks_header() {
+        let mut b = BINARY_CUBE.to_vec();
+        b[..10].copy_from_slice(b"solidworks");
+        b.extend_from_slice(&[0u8; 4]);
+        let mesh = parse_stl(&b).unwrap();
+        assert_eq!(mesh.triangles.len(), 12);
+        assert_eq!(mesh.bounds().min, Vec3::new(-1.0, -1.0, -1.0));
+        assert_eq!(mesh.bounds().max, Vec3::new(1.0, 1.0, 1.0));
     }
 }
