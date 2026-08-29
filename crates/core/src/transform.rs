@@ -50,10 +50,15 @@ pub fn view_matrix(view: ViewAxis) -> Mat3 {
     match view {
         ViewAxis::Top => Mat3::identity(),
         // -90 about X sends model +Y to world -Z, so scrubbing world Z walks
-        // the model's Y from front to back.
+        // the model's Y from its maximum toward its minimum. Model +Z comes up.
         ViewAxis::Front => euler_deg(-90.0, 0.0, 0.0),
-        // +90 about Y sends model +X to world -Z.
-        ViewAxis::Side => euler_deg(0.0, 90.0, 0.0),
+        // A right-side view is the Front preset applied after spinning the
+        // model 90 degrees about Z. Doing it as rot_y(90) instead would put
+        // the model's Z on screen-right and its Y up — i.e. the model would
+        // render rotated 90 degrees, which defeats an orientation checker.
+        // Scrubbing world Z walks the model's X from its maximum toward its
+        // minimum, with model +Z up.
+        ViewAxis::Side => euler_deg(-90.0, 0.0, 0.0).mul(&euler_deg(0.0, 0.0, 90.0)),
     }
 }
 
@@ -136,6 +141,48 @@ mod tests {
     fn top_view_slices_along_model_z() {
         let m = view_matrix(ViewAxis::Top);
         approx(m.apply(Vec3::new(0.0, 0.0, 1.0)), Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn top_view_basis_is_identity() {
+        let m = view_matrix(ViewAxis::Top);
+        approx(m.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(1.0, 0.0, 0.0));
+        approx(m.apply(Vec3::new(0.0, 1.0, 0.0)), Vec3::new(0.0, 1.0, 0.0));
+        approx(m.apply(Vec3::new(0.0, 0.0, 1.0)), Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    /// Pins the whole basis, not just the slice axis: model X stays on screen
+    /// right and model Z comes up, so the view cannot silently roll the model.
+    #[test]
+    fn front_view_puts_model_z_up() {
+        let m = view_matrix(ViewAxis::Front);
+        approx(m.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(1.0, 0.0, 0.0));
+        approx(m.apply(Vec3::new(0.0, 1.0, 0.0)), Vec3::new(0.0, 0.0, -1.0));
+        approx(m.apply(Vec3::new(0.0, 0.0, 1.0)), Vec3::new(0.0, 1.0, 0.0));
+    }
+
+    /// As above for the side view. A bare `rot_y(90)` also lands model X on the
+    /// slice axis but leaves model Y up and model Z on screen right, i.e. the
+    /// model rendered on its side; this pins the up axis so that cannot recur.
+    #[test]
+    fn side_view_puts_model_z_up() {
+        let m = view_matrix(ViewAxis::Side);
+        approx(m.apply(Vec3::new(1.0, 0.0, 0.0)), Vec3::new(0.0, 0.0, -1.0));
+        approx(m.apply(Vec3::new(0.0, 1.0, 0.0)), Vec3::new(-1.0, 0.0, 0.0));
+        approx(m.apply(Vec3::new(0.0, 0.0, 1.0)), Vec3::new(0.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn every_view_preset_is_a_proper_rotation() {
+        // A determinant of -1 would mean the preset mirrors the model, which
+        // would show a mirror image rather than a rotated one.
+        for view in [ViewAxis::Top, ViewAxis::Front, ViewAxis::Side] {
+            let m = view_matrix(view).0;
+            let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            assert!((det - 1.0).abs() < 1e-5, "{view:?} has determinant {det}");
+        }
     }
 
     #[test]
