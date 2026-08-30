@@ -47,7 +47,7 @@ describe("createViewerStore", () => {
     const s = createViewerStore();
     s.setBusy(true);
     s.setError("stale");
-    s.modelLoaded(1234, B);
+    s.onModelLoaded(1234, B);
     const st = s.snapshot();
     expect(st.modelLoaded).toBe(true);
     expect(st.triangleCount).toBe(1234);
@@ -59,13 +59,45 @@ describe("createViewerStore", () => {
 
   it("re-centres for the new extent after a view change reports new bounds", () => {
     const s = createViewerStore();
-    s.modelLoaded(2, B);
+    s.onModelLoaded(2, B);
+    s.setAxisPos(25);
     s.setView(ViewAxis.Front);
     expect(s.snapshot().view).toBe(ViewAxis.Front);
+    // Front sweeps the model's Y: an unrelated extent, so 87% through the old
+    // one means nothing. The middle is the only honest default.
     const front = box([-5, -5, 0], [5, 5, 100]);
-    s.boundsChanged(front);
+    s.viewChanged(front);
     expect(s.snapshot().bounds).toEqual(front);
     expect(s.snapshot().axisPos).toBe(50);
+  });
+
+  it("keeps the reading position when a rotation nudge changes the extent", () => {
+    const s = createViewerStore();
+    s.onModelLoaded(1, B);
+    s.setAxisPos(20); // 75% through a span of 40
+    s.setRotation("x", 1);
+    s.boundsChanged(box([-6, -6, -10], [6, 6, 34])); // span 44
+    expect(s.snapshot().axisPos).toBeCloseTo(-10 + 0.75 * 44, 10);
+  });
+
+  it("preserves the fraction through an extent that shrinks", () => {
+    const s = createViewerStore();
+    s.onModelLoaded(1, B);
+    s.setAxisPos(0); // 25% through a span of 40
+    s.boundsChanged(box([-5, -5, 0], [5, 5, 20])); // span 20
+    expect(s.snapshot().axisPos).toBeCloseTo(5, 10);
+  });
+
+  it("centres rather than dividing by zero when an extent is flat", () => {
+    const s = createViewerStore();
+    s.onModelLoaded(1, box([-5, -5, 7], [5, 5, 7])); // a flat plate seen edge-on
+    expect(s.snapshot().axisPos).toBe(7);
+    s.boundsChanged(box([-5, -5, 0], [5, 5, 40]));
+    const pos = s.snapshot().axisPos;
+    expect(Number.isNaN(pos)).toBe(false);
+    expect(pos).toBe(20);
+    s.boundsChanged(box([-5, -5, 3], [5, 5, 3]));
+    expect(s.snapshot().axisPos).toBe(3);
   });
 
   it("records rotation per axis", () => {
@@ -77,7 +109,7 @@ describe("createViewerStore", () => {
 
   it("clamps setAxisPos at both ends of the z range", () => {
     const s = createViewerStore();
-    s.modelLoaded(1, B);
+    s.onModelLoaded(1, B);
     s.setAxisPos(1000);
     expect(s.snapshot().axisPos).toBe(30);
     s.setAxisPos(-1000);
@@ -95,7 +127,7 @@ describe("createViewerStore", () => {
 
   it("steps by exactly one increment of the extent and clamps", () => {
     const s = createViewerStore();
-    s.modelLoaded(1, B);
+    s.onModelLoaded(1, B);
     const step = 40 / AXIS_STEPS;
     s.stepAxis(1);
     expect(s.snapshot().axisPos).toBeCloseTo(10 + step, 10);
@@ -110,8 +142,8 @@ describe("createViewerStore", () => {
   it("reaches identical state from a hardware key and the equivalent on-screen scrub", () => {
     const hw = createViewerStore();
     const ui = createViewerStore();
-    hw.modelLoaded(7, B);
-    ui.modelLoaded(7, B);
+    hw.onModelLoaded(7, B);
+    ui.onModelLoaded(7, B);
 
     hw.handleDeviceKey("PanningRight");
     hw.handleDeviceKey("PanningRight");
@@ -126,7 +158,7 @@ describe("createViewerStore", () => {
 
   it("survives being detached, as the sink's key listener hands it around", () => {
     const s = createViewerStore();
-    s.modelLoaded(1, B);
+    s.onModelLoaded(1, B);
     const { handleDeviceKey, stepAxis } = s;
     const listener: (k: string) => void = handleDeviceKey;
     listener("PanningRight");
@@ -134,9 +166,49 @@ describe("createViewerStore", () => {
     expect(s.snapshot().axisPos).toBeCloseTo(10 + (2 * 40) / AXIS_STEPS, 10);
   });
 
+  it("survives every method being detached from the store", () => {
+    // These are handed to SDK callbacks and Svelte event handlers, which call
+    // them bare. A future method that closes over `this` fails here rather
+    // than at whatever call site first passes it along.
+    const s = createViewerStore();
+    const {
+      onModelLoaded,
+      boundsChanged,
+      viewChanged,
+      setRotation,
+      setView,
+      setMirror,
+      setFilled,
+      setAxisPos,
+      stepAxis,
+      handleDeviceKey,
+      setBusy,
+      setError,
+      setConnected,
+      snapshot,
+    } = s;
+    expect(() => {
+      onModelLoaded(3, B);
+      boundsChanged(B);
+      viewChanged(B);
+      setRotation("x", 5);
+      setView(ViewAxis.Side);
+      setMirror(true);
+      setFilled(true);
+      setAxisPos(4);
+      stepAxis(1);
+      handleDeviceKey("PanningLeft");
+      setBusy(true);
+      setError("e");
+      setConnected(true);
+    }).not.toThrow();
+    expect(snapshot().triangleCount).toBe(3);
+    expect(snapshot().axisPos).toBe(4);
+  });
+
   it("ignores device keys it does not map", () => {
     const s = createViewerStore();
-    s.modelLoaded(1, B);
+    s.onModelLoaded(1, B);
     const before = s.snapshot();
     s.handleDeviceKey("KeyFunction1");
     s.handleDeviceKey("");
@@ -148,7 +220,7 @@ describe("createViewerStore", () => {
     const s = createViewerStore();
     const label = () => get(s.axisLabel);
     expect(label()).toBe("");
-    s.modelLoaded(1, B);
+    s.onModelLoaded(1, B);
     s.setAxisPos(12.44);
     expect(label()).toBe("Z 12.4 mm");
     s.setView(ViewAxis.Front);
@@ -159,7 +231,7 @@ describe("createViewerStore", () => {
 
   it("records an error without unloading the current model", () => {
     const s = createViewerStore();
-    s.modelLoaded(9, B);
+    s.onModelLoaded(9, B);
     s.setError("not a valid STL");
     const st = s.snapshot();
     expect(st.error).toBe("not a valid STL");

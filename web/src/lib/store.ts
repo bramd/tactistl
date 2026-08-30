@@ -74,9 +74,25 @@ const middle = (b: Bounds) => (b.min.z + b.max.z) / 2;
 
 export interface ViewerStore extends Readable<ViewerState> {
   /** A model finished parsing: centre the scrubber and clear any stale error. */
-  modelLoaded(triangleCount: number, bounds: Bounds): void;
-  /** New rotated extent after a rotation or view change; re-centres the scrubber. */
+  onModelLoaded(triangleCount: number, bounds: Bounds): void;
+  /**
+   * A new rotated extent for the SAME sweep axis, after a rotation change.
+   *
+   * Keeps the same fraction through the extent rather than re-centring. A user
+   * nudging the rotation a degree to compare is reading one cross-section; a
+   * silent jump back to the middle loses their place, and the only feedback is
+   * the display changing under their fingers, which reads as the rotation
+   * having done something drastic. A degree changes the extent by a fraction
+   * of a percent, so the same fraction is very nearly the same plane.
+   */
   boundsChanged(bounds: Bounds): void;
+  /**
+   * A new rotated extent for a DIFFERENT sweep axis, after a view change.
+   *
+   * Re-centres, because carrying a fraction across is meaningless here: Top to
+   * Front swaps the sweep from the model's Z to its Y, an unrelated extent.
+   */
+  viewChanged(bounds: Bounds): void;
   setRotation(axis: "x" | "y" | "z", degrees: number): void;
   setView(view: ViewAxisValue): void;
   setMirror(mirror: boolean): void;
@@ -96,25 +112,97 @@ export interface ViewerStore extends Readable<ViewerState> {
   axisLabel: Readable<string>;
 }
 
+/**
+ * Every method is a closure bound at construction, never a `this`-dependent
+ * object method. They are handed to SDK callbacks and Svelte event handlers,
+ * which call them detached; one that relied on `this` would throw at whatever
+ * call site first passed it along, which for a hardware key looks like the
+ * button silently doing nothing.
+ */
 export function createViewerStore(): ViewerStore {
   const state = writable<ViewerState>(initialState());
   const { subscribe, update } = state;
 
   /** Scrub relative to the current position; a no-op with no model loaded. */
-  function moveAxis(to: (s: ViewerState, span: number) => number): void {
+  const moveAxis = (to: (s: ViewerState, span: number) => number): void => {
     update((s) => {
       if (!s.bounds) return s;
-      const { min, max } = { min: s.bounds.min.z, max: s.bounds.max.z };
+      const min = s.bounds.min.z;
+      const max = s.bounds.max.z;
       return { ...s, axisPos: clamp(to(s, max - min), min, max) };
     });
-  }
+  };
 
-  /**
-   * Hoisted so the methods below stay detach-safe: `handleDeviceKey` is handed
-   * straight to the sink's key listener, which calls it unbound.
-   */
-  const stepAxis = (n: number) =>
+  const onModelLoaded = (triangleCount: number, bounds: Bounds): void => {
+    update((s) => ({
+      ...s,
+      modelLoaded: true,
+      triangleCount,
+      bounds,
+      axisPos: middle(bounds),
+      busy: false,
+      error: null,
+    }));
+  };
+
+  const boundsChanged = (bounds: Bounds): void => {
+    update((s) => {
+      const oldSpan = s.bounds ? s.bounds.max.z - s.bounds.min.z : 0;
+      // A flat extent has no fraction to preserve, and dividing by its span
+      // would put NaN on the scrubber, which every later clamp would carry.
+      const fraction =
+        s.bounds && oldSpan > 0 ? (s.axisPos - s.bounds.min.z) / oldSpan : 0.5;
+      const pos = bounds.min.z + fraction * (bounds.max.z - bounds.min.z);
+      return { ...s, bounds, axisPos: clamp(pos, bounds.min.z, bounds.max.z) };
+    });
+  };
+
+  const viewChanged = (bounds: Bounds): void => {
+    update((s) => ({ ...s, bounds, axisPos: middle(bounds) }));
+  };
+
+  const setRotation = (axis: "x" | "y" | "z", degrees: number): void => {
+    update((s) => ({ ...s, rotation: { ...s.rotation, [axis]: degrees } }));
+  };
+
+  const setView = (view: ViewAxisValue): void => {
+    update((s) => ({ ...s, view }));
+  };
+
+  const setMirror = (mirror: boolean): void => {
+    update((s) => ({ ...s, mirror }));
+  };
+
+  const setFilled = (filled: boolean): void => {
+    update((s) => ({ ...s, filled }));
+  };
+
+  const setAxisPos = (pos: number): void => {
+    moveAxis(() => pos);
+  };
+
+  const stepAxis = (n: number): void => {
     moveAxis((s, span) => s.axisPos + n * (span / AXIS_STEPS));
+  };
+
+  const handleDeviceKey = (keyCode: string): void => {
+    if (keyCode === "PanningRight") stepAxis(1);
+    else if (keyCode === "PanningLeft") stepAxis(-1);
+  };
+
+  const setBusy = (busy: boolean): void => {
+    update((s) => ({ ...s, busy }));
+  };
+
+  const setError = (error: string | null): void => {
+    update((s) => ({ ...s, error }));
+  };
+
+  const setConnected = (connected: boolean): void => {
+    update((s) => ({ ...s, connected }));
+  };
+
+  const snapshot = (): ViewerState => get(state);
 
   const axisLabel = derived(state, (s) =>
     s.bounds ? `${AXIS_LETTER[s.view]} ${s.axisPos.toFixed(1)} mm` : "",
@@ -123,64 +211,19 @@ export function createViewerStore(): ViewerStore {
   return {
     subscribe,
     axisLabel,
-
-    modelLoaded(triangleCount, bounds) {
-      update((s) => ({
-        ...s,
-        modelLoaded: true,
-        triangleCount,
-        bounds,
-        axisPos: middle(bounds),
-        busy: false,
-        error: null,
-      }));
-    },
-
-    boundsChanged(bounds) {
-      update((s) => ({ ...s, bounds, axisPos: middle(bounds) }));
-    },
-
-    setRotation(axis, degrees) {
-      update((s) => ({ ...s, rotation: { ...s.rotation, [axis]: degrees } }));
-    },
-
-    setView(view) {
-      update((s) => ({ ...s, view }));
-    },
-
-    setMirror(mirror) {
-      update((s) => ({ ...s, mirror }));
-    },
-
-    setFilled(filled) {
-      update((s) => ({ ...s, filled }));
-    },
-
-    setAxisPos(pos) {
-      moveAxis(() => pos);
-    },
-
+    onModelLoaded,
+    boundsChanged,
+    viewChanged,
+    setRotation,
+    setView,
+    setMirror,
+    setFilled,
+    setAxisPos,
     stepAxis,
-
-    handleDeviceKey(keyCode) {
-      if (keyCode === "PanningRight") stepAxis(1);
-      else if (keyCode === "PanningLeft") stepAxis(-1);
-    },
-
-    setBusy(busy) {
-      update((s) => ({ ...s, busy }));
-    },
-
-    setError(error) {
-      update((s) => ({ ...s, error }));
-    },
-
-    setConnected(connected) {
-      update((s) => ({ ...s, connected }));
-    },
-
-    snapshot() {
-      return get(state);
-    },
+    handleDeviceKey,
+    setBusy,
+    setError,
+    setConnected,
+    snapshot,
   };
 }
