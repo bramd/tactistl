@@ -315,8 +315,9 @@ the scrubber at the middle are the defaults, and that slice is the equator, the
 model's widest cross-section. You should feel a circle **40 dots across and 40
 dots tall** — it fills the display's full height, with ten blank columns either
 side. The equator sits in the middle of a band of facets that all have the same
-radius, so any scrubber position within about 2 mm of centre gives the same
-circle — it does not have to be exact.
+radius, so any scrubber position within about 1 mm of centre gives the same
+circle — it does not have to be exact. Even well outside that band the error is
+second-order: 2 mm off centre costs 0.1 mm of radius, a tenth of a dot.
 
 Then read the shape:
 
