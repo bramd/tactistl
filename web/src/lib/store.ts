@@ -109,6 +109,13 @@ export function createViewerStore(): ViewerStore {
     });
   }
 
+  /**
+   * Hoisted so the methods below stay detach-safe: `handleDeviceKey` is handed
+   * straight to the sink's key listener, which calls it unbound.
+   */
+  const stepAxis = (n: number) =>
+    moveAxis((s, span) => s.axisPos + n * (span / AXIS_STEPS));
+
   const axisLabel = derived(state, (s) =>
     s.bounds ? `${AXIS_LETTER[s.view]} ${s.axisPos.toFixed(1)} mm` : "",
   );
@@ -153,13 +160,11 @@ export function createViewerStore(): ViewerStore {
       moveAxis(() => pos);
     },
 
-    stepAxis(n) {
-      moveAxis((s, span) => s.axisPos + n * (span / AXIS_STEPS));
-    },
+    stepAxis,
 
     handleDeviceKey(keyCode) {
-      if (keyCode === "PanningRight") this.stepAxis(1);
-      else if (keyCode === "PanningLeft") this.stepAxis(-1);
+      if (keyCode === "PanningRight") stepAxis(1);
+      else if (keyCode === "PanningLeft") stepAxis(-1);
     },
 
     setBusy(busy) {

@@ -124,6 +124,16 @@ describe("createViewerStore", () => {
     expect(hw.snapshot().axisPos).toBeCloseTo(10 + 40 / AXIS_STEPS, 10);
   });
 
+  it("survives being detached, as the sink's key listener hands it around", () => {
+    const s = createViewerStore();
+    s.modelLoaded(1, B);
+    const { handleDeviceKey, stepAxis } = s;
+    const listener: (k: string) => void = handleDeviceKey;
+    listener("PanningRight");
+    stepAxis(1);
+    expect(s.snapshot().axisPos).toBeCloseTo(10 + (2 * 40) / AXIS_STEPS, 10);
+  });
+
   it("ignores device keys it does not map", () => {
     const s = createViewerStore();
     s.modelLoaded(1, B);
