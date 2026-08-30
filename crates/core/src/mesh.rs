@@ -28,6 +28,13 @@ pub enum ParseError {
     /// cross-section coordinates, i.e. a blank or garbage tactile frame with no
     /// error to explain it.
     NonFinite,
+    /// The file is a valid binary STL, but its triangles would not fit in
+    /// memory. The count is trustworthy here — it passed the `84 + 50n`
+    /// length check — so this is not a malformed file; it is a real file we
+    /// cannot hold. Without this the reserve simply aborts the WASM module,
+    /// and an abort is not catchable: the module is dead, the page goes blank,
+    /// and nothing is announced. See `MESH_BUDGET_BYTES`.
+    TooLarge,
 }
 
 impl ParseError {
@@ -50,6 +57,12 @@ impl std::fmt::Display for ParseError {
             },
             ParseError::NoGeometry => write!(f, "the file contains no triangles"),
             ParseError::NonFinite => write!(f, "this STL contains invalid coordinates"),
+            // Deliberately the *same* sentence the WASM boundary already gives
+            // a file too big to be a length at all. The two refusals differ in
+            // mechanism, not in anything the listener can do about it, and one
+            // clear sentence beats two that are nearly the same. Nothing about
+            // megabytes or linear memory belongs in text read aloud.
+            ParseError::TooLarge => write!(f, "this STL file is too large to open"),
         }
     }
 }
@@ -103,6 +116,44 @@ fn binary_triangle_count_for(head: &[u8], total_len: usize) -> Option<usize> {
     // Guard the multiply: n comes straight from the file and is untrusted.
     let exact = n.checked_mul(50).and_then(|b| b.checked_add(84)) == Some(total_len);
     exact.then_some(n)
+}
+
+/// How many bytes of triangles one mesh may cost: **1.75 GiB**.
+///
+/// Not a round number picked for looking safe — it is what is left after the
+/// three things that have to fit alongside it:
+///
+/// * wasm32 gives the module a 4 GiB linear address space, and that is a hard
+///   ceiling, not a target: `usize` is 32-bit, so nothing above it is even
+///   addressable.
+/// * Roughly 0.5 GiB goes to everything that is not the mesh — the module and
+///   its stack, the in-flight file chunk, the rasterizer's buffers, and the
+///   allocator's own slack and fragmentation, which matters because a
+///   `reserve_exact` of this size needs one *contiguous* run.
+/// * The remaining 3.5 GiB is halved, because reloading a model holds two
+///   meshes at once: the worker parses into a temporary and only frees the old
+///   handle once the new one exists, so a session's high-water mark is set by
+///   the largest *pair*. wasm32 memory never shrinks, so that high-water mark
+///   is permanent — the budget has to be a whole-session figure, not a
+///   parse-time one.
+///
+/// `(4 - 0.5) / 2 = 1.75 GiB`. At 36 bytes per triangle that is 52,195,783
+/// triangles, i.e. a binary STL of about 2.61 GB. A file above that is refused
+/// with a sentence instead of aborting the module.
+const MESH_BUDGET_BYTES: usize = 1_879_048_192;
+
+/// Would a mesh of `n` triangles fit in `budget` bytes?
+///
+/// The single comparison both parsers run, for the same reason
+/// `binary_triangle_count_for` is shared: this is what stands between a
+/// legitimate but enormous triangle count and an uncatchable abort, and two
+/// checks that merely look alike would eventually stop being alike.
+///
+/// `checked_mul` because `n` is bounded by the file length, not by anything
+/// that keeps `n * 36` inside a `usize` on a 32-bit target.
+fn mesh_fits(n: usize, budget: usize) -> bool {
+    n.checked_mul(std::mem::size_of::<Triangle>())
+        .is_some_and(|bytes| bytes <= budget)
 }
 
 /// A `Read + Seek` view of `head` followed by `tail`, borrowing both.
@@ -188,7 +239,22 @@ impl std::io::Seek for Patched<'_> {
 /// full copy here was measured at +150 MB of peak WASM memory on a 150 MB STL
 /// with a `"solid "` header, which is the one case a naive fix-up hits.
 pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
+    parse_stl_with_budget(bytes, MESH_BUDGET_BYTES)
+}
+
+/// `parse_stl`, with the memory budget as a parameter so the refusal can be
+/// tested at a threshold a fixture can actually cross. The public entry point
+/// passes the real constant; nothing else may.
+fn parse_stl_with_budget(bytes: &[u8], budget: usize) -> Result<Mesh, ParseError> {
     let exact = binary_triangle_count(bytes);
+    // Before the reader is built and before a single byte is decoded, let
+    // alone reserved. A feasibility check that runs after `reserve_exact` is
+    // worth nothing: the abort has already happened by then.
+    if let Some(n) = exact {
+        if !mesh_fits(n, budget) {
+            return Err(ParseError::TooLarge);
+        }
+    }
     let mut source = if exact.is_some() {
         if bytes.starts_with(b"solid ") {
             // Workaround: blank the first header bytes so the probe fails and
@@ -219,6 +285,9 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
     // allocate ~103 GB. What makes this safe is that a count is only returned
     // once `84 + 50 * n == bytes.len()` holds exactly, which bounds the
     // reserve at `0.72 * bytes.len()` — smaller than the input it came from.
+    // Bounded is not the same as affordable, though: 0.72x a 3.5 GB file is
+    // still more than wasm32 can hold, which is what `mesh_fits` refuses above
+    // before reaching this line.
     //
     // Worth the care: without it the vector doubles its way up, and at the
     // final doubling the old and new buffers are live at once. Measured on a
@@ -329,15 +398,28 @@ enum StreamState {
 pub struct StreamParser {
     total_len: usize,
     received: usize,
+    /// Carried rather than read from the constant at the point of use, so the
+    /// ASCII fallback can hand the *same* budget to `parse_stl_with_budget`.
+    /// Equivalence between the two parsers is the property that matters, and
+    /// it must hold at any budget, not only the real one.
+    budget: usize,
     state: StreamState,
 }
 
 impl StreamParser {
     /// `total_len` is the file's size in bytes, known before any of it is read.
     pub fn new(total_len: usize) -> Self {
+        Self::with_budget(total_len, MESH_BUDGET_BYTES)
+    }
+
+    /// The same, with the memory budget as a parameter. Private because the
+    /// only caller that may choose a budget other than the real constant is a
+    /// test — no fixture a test suite can hold would ever cross 1.75 GiB.
+    fn with_budget(total_len: usize, budget: usize) -> Self {
         StreamParser {
             total_len,
             received: 0,
+            budget,
             state: StreamState::Header(Vec::new()),
         }
     }
@@ -379,19 +461,35 @@ impl StreamParser {
                 return Ok(());
             }
             self.state = match binary_triangle_count_for(buf, self.total_len) {
-                Some(n) => StreamState::Binary {
-                    remaining: n,
-                    pending: Vec::with_capacity(BINARY_RECORD_LEN),
-                    // The one allocation that matters, and the reason the
-                    // length rule may not be weakened to an inequality: `n` is
-                    // verified, not merely bounded, so this is exact and
-                    // capped at 0.72x the file.
-                    triangles: {
-                        let mut v = Vec::new();
-                        v.reserve_exact(n);
-                        v
-                    },
-                },
+                Some(n) => {
+                    // Before the `reserve_exact` below, which is the whole
+                    // point: a verified count of 60 million triangles is not a
+                    // malformed file, it is a real file that would abort the
+                    // module on the next line. Refusing here — as a distinct
+                    // error, never by pretending the count is unusable — is
+                    // what turns a blank page into a sentence.
+                    //
+                    // It must NOT fall through to the `None` arm: that arm
+                    // buffers the entire file for the ASCII reader, which for
+                    // a multi-gigabyte input is strictly worse than the abort
+                    // being avoided.
+                    if !mesh_fits(n, self.budget) {
+                        return Err(ParseError::TooLarge);
+                    }
+                    StreamState::Binary {
+                        remaining: n,
+                        pending: Vec::with_capacity(BINARY_RECORD_LEN),
+                        // The one allocation that matters, and the reason the
+                        // length rule may not be weakened to an inequality: `n` is
+                        // verified, not merely bounded, so this is exact and
+                        // capped at 0.72x the file.
+                        triangles: {
+                            let mut v = Vec::new();
+                            v.reserve_exact(n);
+                            v
+                        },
+                    }
+                }
                 None => {
                     let mut all = std::mem::take(buf);
                     // Sized from the declared length, not from anything the
@@ -484,9 +582,9 @@ impl StreamParser {
                 // Under 84 bytes in total, so it can never have been binary.
                 // Hand it to the ASCII reader, which is where the empty file
                 // and garbage cases get their existing errors.
-                parse_stl(&buf)
+                parse_stl_with_budget(&buf, self.budget)
             }
-            StreamState::Ascii(buf) => parse_stl(&buf),
+            StreamState::Ascii(buf) => parse_stl_with_budget(&buf, self.budget),
             StreamState::Binary { remaining, pending, triangles } => {
                 if remaining != 0 || !pending.is_empty() {
                     return Err(truncated());
@@ -749,7 +847,14 @@ mod tests {
 
     /// Feed `bytes` through a `StreamParser` in `chunk` sized pieces.
     fn stream_in(bytes: &[u8], chunk: usize) -> Result<Mesh, ParseError> {
-        let mut p = StreamParser::new(bytes.len());
+        stream_in_with_budget(bytes, chunk, MESH_BUDGET_BYTES)
+    }
+
+    /// The same, at a chosen memory budget. Every equivalence test funnels
+    /// through this one implementation so the two parsers cannot be compared
+    /// under two subtly different harnesses.
+    fn stream_in_with_budget(bytes: &[u8], chunk: usize, budget: usize) -> Result<Mesh, ParseError> {
+        let mut p = StreamParser::with_budget(bytes.len(), budget);
         for part in bytes.chunks(chunk.max(1)) {
             p.push(part)?;
         }
@@ -769,7 +874,18 @@ mod tests {
     /// including on the error path: an error in one must be an error in the
     /// other, with the same `Display` text (that text is read aloud).
     fn assert_agrees(bytes: &[u8], chunk: usize) {
-        match (parse_stl(bytes), stream_in(bytes, chunk)) {
+        assert_agrees_with_budget(bytes, chunk, MESH_BUDGET_BYTES);
+    }
+
+    /// The same comparison at a chosen memory budget, so the new refusal is
+    /// held to the same equivalence as every other one: a budget no fixture
+    /// can cross would leave `TooLarge` the one error path never checked for
+    /// agreement between the parsers.
+    fn assert_agrees_with_budget(bytes: &[u8], chunk: usize, budget: usize) {
+        match (
+            parse_stl_with_budget(bytes, budget),
+            stream_in_with_budget(bytes, chunk, budget),
+        ) {
             (Ok(whole), Ok(streamed)) => assert!(
                 same_mesh(&whole, &streamed),
                 "chunk {chunk}: streamed mesh differs from the whole-file parse"
@@ -981,6 +1097,164 @@ mod tests {
                 .to_string(),
             "the file contains no triangles"
         );
+    }
+
+    // --- a mesh too large to hold ---------------------------------------
+    //
+    // A binary STL of ~3.5 GB carries a *verified* triangle count: the
+    // `84 + 50n` equality holds, so the count is honest and the reserve is
+    // bounded by the file. Bounded is not affordable — 0.72x of 3.5 GB is more
+    // than wasm32 has — and `reserve_exact` failing is not an error but an
+    // abort: the module dies, the page goes blank, and a user who cannot see
+    // the page has no way to tell that from the app simply not responding.
+    //
+    // No test can build such a file, so the check takes its budget as a
+    // parameter and these tests cross it at 432 bytes instead of 1.75 GiB.
+
+    /// One cube's worth of triangles, in bytes: the budget at which the
+    /// fixture exactly fits.
+    const CUBE_MESH_BYTES: usize = 12 * 36;
+
+    /// The size the whole budget is denominated in. Pinned because
+    /// `MESH_BUDGET_BYTES`, the triangle cap, and the file ceiling quoted in
+    /// its comment are all derived from this number; if `Triangle` ever grows
+    /// a field, those figures are wrong and this is what says so.
+    #[test]
+    fn a_triangle_costs_thirty_six_bytes() {
+        assert_eq!(std::mem::size_of::<Triangle>(), 36);
+        assert_eq!(CUBE_MESH_BYTES, 432);
+    }
+
+    /// A mesh that exactly fills the budget is allowed: the check refuses what
+    /// does not fit, not what barely does.
+    #[test]
+    fn a_mesh_that_exactly_fits_the_budget_is_accepted() {
+        assert!(mesh_fits(12, CUBE_MESH_BYTES));
+        assert_eq!(
+            parse_stl_with_budget(BINARY_CUBE, CUBE_MESH_BYTES)
+                .unwrap()
+                .triangles
+                .len(),
+            12
+        );
+        assert_eq!(
+            stream_in_with_budget(BINARY_CUBE, 64, CUBE_MESH_BYTES)
+                .unwrap()
+                .triangles
+                .len(),
+            12
+        );
+    }
+
+    /// One byte over, and both parsers refuse — with the same sentence, which
+    /// is the property that actually matters, since that sentence is what the
+    /// user hears.
+    #[test]
+    fn a_mesh_one_byte_over_the_budget_is_refused_by_both_parsers() {
+        let over = CUBE_MESH_BYTES - 1;
+        assert!(!mesh_fits(12, over));
+        let whole = parse_stl_with_budget(BINARY_CUBE, over).unwrap_err();
+        let streamed = stream_in_with_budget(BINARY_CUBE, 64, over).unwrap_err();
+        // `TooLarge` specifically, not merely "an error": falling through to
+        // the ASCII fallback would also produce one, while quietly buffering
+        // the entire multi-gigabyte file — worse than the abort being fixed.
+        assert!(matches!(whole, ParseError::TooLarge), "got {whole:?}");
+        assert!(matches!(streamed, ParseError::TooLarge), "got {streamed:?}");
+        assert_eq!(whole.to_string(), "this STL file is too large to open");
+        assert_eq!(streamed.to_string(), "this STL file is too large to open");
+    }
+
+    /// Invariant 4, extended to the new refusal: the two parsers must reject
+    /// the same input with the same text, at any chunking.
+    #[test]
+    fn the_two_parsers_refuse_an_unaffordable_mesh_identically() {
+        for chunk in [1, 7, 49, 50, 83, 84, 85, 1024, BINARY_CUBE.len()] {
+            assert_agrees_with_budget(BINARY_CUBE, chunk, CUBE_MESH_BYTES - 1);
+        }
+        // And still agree when the budget is generous, i.e. the parameter has
+        // not quietly changed what either parser does to an ordinary file.
+        for chunk in [1, 50, 1024] {
+            assert_agrees_with_budget(BINARY_CUBE, chunk, CUBE_MESH_BYTES);
+        }
+    }
+
+    /// The ordering proof for the streaming parser: the refusal must arrive on
+    /// the very push that completes the 84-byte header — the same push that
+    /// would otherwise call `reserve_exact`. A check that ran later, at
+    /// `finish` or once records started arriving, would be running after the
+    /// abort it exists to prevent.
+    #[test]
+    fn the_streaming_refusal_arrives_before_any_triangle_byte() {
+        let mut p = StreamParser::with_budget(BINARY_CUBE.len(), CUBE_MESH_BYTES - 1);
+        // 83 bytes: the format decision cannot have been made yet, so nothing
+        // is refused and nothing is reserved.
+        p.push(&BINARY_CUBE[..83]).unwrap();
+        // The 84th byte completes the header, and the refusal is immediate —
+        // before a single one of the record bytes has been offered.
+        let err = p.push(&BINARY_CUBE[83..84]).unwrap_err();
+        assert!(matches!(err, ParseError::TooLarge), "got {err:?}");
+    }
+
+    /// The ordering proof for the whole-buffer parser. The fixture's first
+    /// vertex is NaN, which `parse_stl` reports as `NonFinite` — but only by
+    /// decoding triangles, which happens after the reserve. `TooLarge` winning
+    /// therefore proves the budget check runs ahead of both the reader and the
+    /// allocation.
+    #[test]
+    fn the_whole_file_refusal_preempts_reading_the_triangles() {
+        let poisoned = poke_float(FIRST_VERTEX_X, f32::NAN);
+        assert!(
+            matches!(parse_stl(&poisoned).unwrap_err(), ParseError::NonFinite),
+            "the fixture must fail for a different reason at a real budget"
+        );
+        for err in [
+            parse_stl_with_budget(&poisoned, CUBE_MESH_BYTES - 1).unwrap_err(),
+            stream_in_with_budget(&poisoned, 16, CUBE_MESH_BYTES - 1).unwrap_err(),
+        ] {
+            assert!(matches!(err, ParseError::TooLarge), "got {err:?}");
+        }
+    }
+
+    /// The message is announced by a screen reader, so it carries none of the
+    /// machinery that produced it.
+    #[test]
+    fn the_too_large_message_is_human_readable() {
+        let msg = ParseError::TooLarge.to_string();
+        for jargon in ["GB", "MB", "byte", "memory", "wasm", "allocat", "triangle"] {
+            assert!(!msg.contains(jargon), "leaked jargon {jargon:?}: {msg}");
+        }
+        assert!(msg.contains("STL"), "unhelpful message: {msg}");
+        // Deliberately identical to the WASM boundary's refusal of a file too
+        // big to be a length at all; see the `Display` impl.
+        assert_eq!(msg, "this STL file is too large to open");
+    }
+
+    /// `mesh_fits` must not be the place a 32-bit multiply wraps: a wrapped
+    /// product could come out *small* and wave through the very allocation the
+    /// check exists to stop.
+    #[test]
+    fn a_triangle_count_whose_byte_size_overflows_never_fits() {
+        assert!(!mesh_fits(usize::MAX, MESH_BUDGET_BYTES));
+        assert!(!mesh_fits(usize::MAX / 8, MESH_BUDGET_BYTES));
+        assert!(!mesh_fits(usize::MAX / 36 + 1, MESH_BUDGET_BYTES));
+    }
+
+    /// The real constant, checked against the arithmetic its comment claims:
+    /// two meshes plus half a gigabyte of everything else, inside 4 GiB.
+    #[test]
+    fn the_real_budget_leaves_room_for_a_reloaded_pair_under_the_wasm32_limit() {
+        const WASM32_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+        const OVERHEAD: u64 = 512 * 1024 * 1024;
+        let pair = 2 * MESH_BUDGET_BYTES as u64;
+        assert!(
+            pair + OVERHEAD <= WASM32_LIMIT,
+            "a reloaded pair plus overhead must fit in linear memory"
+        );
+        // The ceilings quoted in the constant's comment, pinned so they cannot
+        // drift from the number they describe.
+        let triangles = MESH_BUDGET_BYTES / std::mem::size_of::<Triangle>();
+        assert_eq!(triangles, 52_195_783);
+        assert_eq!(84 + 50 * triangles as u64, 2_609_789_234);
     }
 
     /// A zero-length push is legal and must change nothing — a `ReadableStream`
