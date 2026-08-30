@@ -40,6 +40,11 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      # Deliberately floating: the toolchain is `stable`, so a future Rust
+      # release can add a lint and turn this red on a commit that changed
+      # nothing. That is accepted - new lints are useful signal and the fixes
+      # are small. If it becomes noise, pin the toolchain in a
+      # rust-toolchain.toml instead of dropping `-D warnings`.
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 

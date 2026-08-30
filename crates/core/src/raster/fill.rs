@@ -52,7 +52,10 @@ pub fn fill_scanlines(bmp: &mut Bitmap, segments: &[Segment]) {
         }
         crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        for pair in crossings.chunks_exact(2) {
+        // `as_chunks::<2>()` rather than `chunks_exact(2)`: same pairing, and
+        // clippy prefers it for a constant chunk size. `.0` is the exact pairs;
+        // the remainder is always empty because the odd case returned above.
+        for pair in crossings.as_chunks::<2>().0 {
             let from = pair[0].ceil() as i32;
             let to = pair[1].floor() as i32;
             for x in from..=to {
