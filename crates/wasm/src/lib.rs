@@ -47,7 +47,13 @@ impl MeshHandle {
         // than letting Bitmap::new attempt the allocation: on wasm32 `usize` is
         // 32-bit, and a huge `vec![0; w * h]` aborts the module outright, which
         // the user experiences as a dead page with no error.
-        const MAX_DIM: usize = 4096;
+        //
+        // 512 is deliberately tight: the largest tactile display ever shipped
+        // is about 120x60, and the target Dot Pad is 60x40. A loose cap does
+        // not just risk an allocation failure — rasterizing millions of cells
+        // on every slider tick would freeze the page, which is the same
+        // failure arriving by a slower route.
+        const MAX_DIM: usize = 512;
         if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
             return Err(JsError::new(&format!(
                 "unsupported display size {width}x{height}"
