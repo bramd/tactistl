@@ -216,17 +216,43 @@ describe("createViewerStore", () => {
     expect(s.snapshot()).toEqual(before);
   });
 
-  it("labels the axis with the letter for the current view", () => {
+  it("labels the position within the sweep, not a coordinate", () => {
     const s = createViewerStore();
     const label = () => get(s.axisLabel);
     expect(label()).toBe("");
+    s.onModelLoaded(1, B); // z from -10 to 30: a span of 40
+    s.setAxisPos(2.44);
+    expect(label()).toBe("12.4 of 40.0 mm");
+  });
+
+  it("reads 0.0 at the start of the sweep and the full span at the end", () => {
+    const s = createViewerStore();
+    const label = () => get(s.axisLabel);
     s.onModelLoaded(1, B);
-    s.setAxisPos(12.44);
-    expect(label()).toBe("Z 12.4 mm");
+    s.setAxisPos(-10);
+    expect(label()).toBe("0.0 of 40.0 mm");
+    s.setAxisPos(30);
+    expect(label()).toBe("40.0 of 40.0 mm");
+  });
+
+  it("does not change when only the view changes", () => {
+    // It carried a view-dependent axis letter once. The letter named the
+    // view's sweep axis rather than the model's, so it stopped being true
+    // under any user rotation.
+    const s = createViewerStore();
+    s.onModelLoaded(1, B);
+    s.setAxisPos(5);
+    const before = get(s.axisLabel);
     s.setView(ViewAxis.Front);
-    expect(label()).toBe("Y 12.4 mm");
+    expect(get(s.axisLabel)).toBe(before);
     s.setView(ViewAxis.Side);
-    expect(label()).toBe("X 12.4 mm");
+    expect(get(s.axisLabel)).toBe(before);
+  });
+
+  it("labels a flat extent without producing NaN", () => {
+    const s = createViewerStore();
+    s.onModelLoaded(1, box([-5, -5, 7], [5, 5, 7]));
+    expect(get(s.axisLabel)).toBe("0.0 of 0.0 mm");
   });
 
   it("records an error without unloading the current model", () => {

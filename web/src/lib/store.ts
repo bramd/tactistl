@@ -25,13 +25,6 @@ export type ViewAxisValue = (typeof ViewAxis)[keyof typeof ViewAxis];
 /** Scrubber resolution: the number of increments across the whole extent. */
 export const AXIS_STEPS = 100;
 
-/** The letter shown for each view, matching the axis the scrubber walks. */
-const AXIS_LETTER: Record<ViewAxisValue, string> = {
-  [ViewAxis.Top]: "Z",
-  [ViewAxis.Front]: "Y",
-  [ViewAxis.Side]: "X",
-};
-
 export interface ViewerState {
   modelLoaded: boolean;
   triangleCount: number;
@@ -204,9 +197,25 @@ export function createViewerStore(): ViewerStore {
 
   const snapshot = (): ViewerState => get(state);
 
-  const axisLabel = derived(state, (s) =>
-    s.bounds ? `${AXIS_LETTER[s.view]} ${s.axisPos.toFixed(1)} mm` : "",
-  );
+  /**
+   * Position within the sweep -- distance from its start, and its full span --
+   * rather than a coordinate.
+   *
+   * There is deliberately no axis letter. A letter would name the VIEW's sweep
+   * axis, not the model's: after any user rotation it corresponds to nothing
+   * the user could cross-check in a slicer, and Front and Side are
+   * sign-flipping besides, so the number counted DOWN as the model's Y or X
+   * counted up. A plausible-looking coordinate that quietly lies is the worst
+   * thing to hand someone whose whole purpose here is confirming orientation.
+   * A position within the sweep is true under every rotation and view, and
+   * carrying the span keeps the sense of scale a bare percentage would lose.
+   */
+  const axisLabel = derived(state, (s) => {
+    if (!s.bounds) return "";
+    const from = s.axisPos - s.bounds.min.z;
+    const span = s.bounds.max.z - s.bounds.min.z;
+    return `${from.toFixed(1)} of ${span.toFixed(1)} mm`;
+  });
 
   return {
     subscribe,
