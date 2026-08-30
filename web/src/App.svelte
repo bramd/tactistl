@@ -242,18 +242,24 @@
 
   <ModelLoader busy={$viewer.busy} onfile={(f) => void loadFile(f)} />
 
+  <!--
+    Disabled while a load is in flight as well as before the first one: a
+    rotation committed during a parse would leave the store holding the new
+    angle against the bounds of the old one, because the load discards any
+    bounds fetch still outstanding when it lands.
+  -->
   <section aria-labelledby="orientation-heading">
     <h2 id="orientation-heading">Orientation</h2>
     <RotationControls
       rotation={$viewer.rotation}
-      disabled={!$viewer.modelLoaded}
+      disabled={!$viewer.modelLoaded || $viewer.busy}
       onrotate={onRotate}
     />
     <ViewControls
       view={$viewer.view}
       mirror={$viewer.mirror}
       filled={$viewer.filled}
-      disabled={!$viewer.modelLoaded}
+      disabled={!$viewer.modelLoaded || $viewer.busy}
       onview={onView}
       onmirror={viewer.setMirror}
       onfilled={viewer.setFilled}
@@ -262,7 +268,7 @@
       bounds={$viewer.bounds}
       axisPos={$viewer.axisPos}
       label={$axisLabel}
-      disabled={!$viewer.modelLoaded}
+      disabled={!$viewer.modelLoaded || $viewer.busy}
       onpos={viewer.setAxisPos}
     />
   </section>
