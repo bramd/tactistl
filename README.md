@@ -181,6 +181,26 @@ choice nor an override. That mirrors SDK internals, so it must be re-checked if
 the vendored SDK is ever updated — `vendor/version-pin.test.ts` is the tripwire
 that will fail first.
 
+### What a 320A does, from testing one
+
+The following is hardware behaviour observed on a Dot Pad 320A. It is not in
+the SDK and not in any documentation, and it is the reason the app does not try
+to force `ALL_PARTIAL` or `ALL_LINE` on that model.
+
+A 320A **does** answer `requestDisplayPartial`. In practice the partial path is
+buggy, so a working reply is not a reason to use it.
+
+A 320A **does** support a whole-display write addressed as line 1. That is
+slightly faster overall than writing line by line — but the display is blocked
+for the duration of the write, and will not respond to button presses or to
+scrubber updates until it completes.
+
+Line by line therefore stays the better trade for this app. Scrubbing usually
+changes only a small part of the frame, and what matters while scrubbing is how
+soon the device can take the *next* input, not how quickly any single full
+refresh finishes. Line by line gives lower latency to the next input, at the
+cost of a slightly slower full refresh.
+
 **Flow control is ack-gated inside the SDK.** The send loop gates on
 `dotCommandSendReady` and advances on `ResponseDisplayLineAck` /
 `notificateDisplayComplete`. The app must not add pacing, chunking or retry
