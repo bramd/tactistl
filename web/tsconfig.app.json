@@ -26,5 +26,14 @@
    * and type-checks, because TypeScript prefers the sibling generated
    * `tactistl_wasm.d.ts` over the .js, and `skipLibCheck` covers that.
    */
-  "exclude": ["src/lib/wasm"]
+  /**
+   * `src/lib/dotpad/vendor/` holds the Dot Inc Web SDK, vendored byte-identical
+   * to upstream so it can be re-downloaded and diffed. It is minified
+   * third-party JS and trips `checkJs` with ~342 implicit-any errors that are
+   * not ours to fix and must not be patched in place. Only the `.js` is
+   * excluded, so our hand-written `DotPadSDK-3.0.2.d.ts` is still type-checked
+   * as a root file, and an `import ... from "./vendor/DotPadSDK-3.0.2"`
+   * resolves to that `.d.ts` rather than the excluded `.js`.
+   */
+  "exclude": ["src/lib/wasm", "src/lib/dotpad/vendor/*.js"]
 }
