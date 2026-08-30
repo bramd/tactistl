@@ -280,7 +280,7 @@ not a detail to be discovered later by whoever tries to publish it.
 ## Manual test plan
 
 **This app has never loaded an STL in a real browser.** Everything above is
-verified by unit tests (115 TypeScript, 70 Rust), by `npm run check`, and by a
+verified by unit tests (123 TypeScript, 70 Rust), by `npm run check`, and by a
 successful production build. Not one of the paths below has been exercised by a
 human. Work through them before trusting any of it.
 
