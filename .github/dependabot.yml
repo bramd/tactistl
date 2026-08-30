@@ -1,0 +1,34 @@
+# Dependabot opens pull requests for dependency updates. It does not merge
+# them: the point is to be told, not to be updated behind your back.
+#
+# Note what is NOT covered here. web/src/lib/dotpad/vendor/DotPadSDK-3.0.2.js
+# is a file copied from dotincorp/dotpad-sdk-guide, not an npm dependency, so
+# no ecosystem below can see it. It is updated by hand, and
+# vendor/version-pin.test.ts fails if its bytes change.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
