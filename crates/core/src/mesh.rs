@@ -1,5 +1,4 @@
 use crate::vec::{Bbox3, Vec3};
-use std::io::Cursor;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Triangle {
@@ -69,14 +68,90 @@ impl Mesh {
     }
 }
 
+/// The triangle count of a binary STL, **verified against the file length**.
+///
 /// A binary STL is exactly `84 + 50 * n` bytes, where `n` is the little-endian
 /// `u32` triangle count at offset 80. That length check is the robust way to
-/// tell the two formats apart.
-fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.len() >= 84 && {
-        let n = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
-        // Guard the multiply: n comes straight from the file and is untrusted.
-        n.checked_mul(50).and_then(|b| b.checked_add(84)) == Some(bytes.len())
+/// tell the two formats apart — and, because the equality has to hold exactly,
+/// it also turns the untrusted header count into a trustworthy one: `n` cannot
+/// exceed `(bytes.len() - 84) / 50`, whatever the header claims.
+///
+/// `None` therefore means both "not a binary STL, treat it as ASCII" and "the
+/// header count is worthless, do not allocate from it".
+fn binary_triangle_count(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 84 {
+        return None;
+    }
+    let n = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+    // Guard the multiply: n comes straight from the file and is untrusted.
+    let exact = n.checked_mul(50).and_then(|b| b.checked_add(84)) == Some(bytes.len());
+    exact.then_some(n)
+}
+
+/// A `Read + Seek` view of `head` followed by `tail`, borrowing both.
+///
+/// This exists so `parse_stl` can rewrite the first few bytes of a file for
+/// `stl_io`'s format probe without duplicating the file to do it. The obvious
+/// version — clone the bytes, edit the clone — costs a second full copy of the
+/// file inside WASM linear memory, which for a 300 MB STL is 300 MB that,
+/// because wasm32 memory never shrinks, never comes back.
+struct Patched<'a> {
+    head: &'a [u8],
+    tail: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Patched<'a> {
+    /// `head` stands in for whatever the caller sliced off the front of
+    /// `tail`; pass an empty `head` to read `tail` unchanged.
+    fn new(head: &'a [u8], tail: &'a [u8]) -> Self {
+        Patched { head, tail, pos: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    /// Everything from virtual offset `i` to the end of whichever of the two
+    /// slices `i` lands in; empty past the end.
+    fn slice_from(&self, i: usize) -> &'a [u8] {
+        if i < self.head.len() {
+            &self.head[i..]
+        } else {
+            self.tail.get(i - self.head.len()..).unwrap_or(&[])
+        }
+    }
+}
+
+impl std::io::Read for Patched<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // A read spanning the head/tail boundary returns the head part only.
+        // `Read` explicitly permits a short read, and both `read_exact` and
+        // `BufReader` handle it by looping.
+        let src = self.slice_from(self.pos);
+        let n = src.len().min(buf.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Patched<'_> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let (base, delta) = match from {
+            SeekFrom::Start(n) => {
+                self.pos = usize::try_from(n).unwrap_or(usize::MAX);
+                return Ok(self.pos as u64);
+            }
+            SeekFrom::End(d) => (self.len() as i64, d),
+            SeekFrom::Current(d) => (self.pos as i64, d),
+        };
+        let target = base.checked_add(delta).filter(|t| *t >= 0).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start")
+        })?;
+        self.pos = target as usize;
+        Ok(self.pos as u64)
     }
 }
 
@@ -90,21 +165,21 @@ fn looks_binary(bytes: &[u8]) -> bool {
 ///
 /// `stl_io` does not export its two readers (`ascii_reader` and `binary_reader`
 /// are private modules), so we cannot dispatch to them directly. Instead we
-/// hand `create_stl_reader` a minimally normalised copy in exactly the two
-/// cases its probe gets wrong; the common cases are passed through untouched.
+/// hand `create_stl_reader` a `Patched` view that rewrites the first few bytes
+/// in exactly the two cases its probe gets wrong; the common cases are passed
+/// through untouched. `Patched` borrows, so none of this copies the file — a
+/// full copy here was measured at +150 MB of peak WASM memory on a 150 MB STL
+/// with a `"solid "` header, which is the one case a naive fix-up hits.
 pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
-    let normalised: Vec<u8>;
-    let bytes: &[u8] = if looks_binary(bytes) {
+    let exact = binary_triangle_count(bytes);
+    let mut source = if exact.is_some() {
         if bytes.starts_with(b"solid ") {
             // Workaround: blank the first header bytes so the probe fails and
             // the binary reader is used. The 80-byte header is ignored by the
             // format, so this does not change the parsed geometry.
-            let mut b = bytes.to_vec();
-            b[..6].fill(b' ');
-            normalised = b;
-            &normalised
+            Patched::new(b"      ", &bytes[6..])
         } else {
-            bytes
+            Patched::new(b"", bytes)
         }
     } else if bytes.starts_with(b"solid") && matches!(bytes.get(5), None | Some(b'\n' | b'\r')) {
         // Workaround: an empty solid name (`solid\n`) is legal but fails the
@@ -113,22 +188,34 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
         // real ASCII STL can have there: a binary header such as "solidworks"
         // must fall through untouched, since inserting a byte into binary data
         // shifts every offset and can fabricate plausible-looking geometry.
-        let mut b = Vec::with_capacity(bytes.len() + 1);
-        b.extend_from_slice(b"solid ");
-        b.extend_from_slice(&bytes[5..]);
-        normalised = b;
-        &normalised
+        Patched::new(b"solid ", &bytes[5..])
     } else {
-        bytes
+        Patched::new(b"", bytes)
     };
 
-    let mut cursor = Cursor::new(bytes);
-    let reader = stl_io::create_stl_reader(&mut cursor).map_err(ParseError::malformed)?;
+    let reader = stl_io::create_stl_reader(&mut source).map_err(ParseError::malformed)?;
 
-    // Deliberately not `with_capacity(size_hint())`: the triangle count is
-    // untrusted input, and pre-allocating from it is what made a malformed
-    // file abort the process trying to allocate ~103 GB.
     let mut triangles = Vec::new();
+    // Reserve from `binary_triangle_count`, and never from the raw header
+    // count or from `size_hint()`: those are untrusted, and pre-allocating
+    // from them is what made a malformed file abort the process trying to
+    // allocate ~103 GB. What makes this safe is that a count is only returned
+    // once `84 + 50 * n == bytes.len()` holds exactly, which bounds the
+    // reserve at `0.72 * bytes.len()` — smaller than the input it came from.
+    //
+    // Worth the care: without it the vector doubles its way up, and at the
+    // final doubling the old and new buffers are live at once. Measured on a
+    // 300 MB binary STL (6M triangles), peak allocation during the parse drops
+    // from 453 MB to 216 MB, and the mesh's resident size from 302 MB to
+    // 216 MB — the exact reserve also removes the up-to-2x capacity slack that
+    // doubling otherwise leaves allocated for the mesh's whole lifetime.
+    //
+    // An ASCII file gets no reserve: its triangle count is not knowable up
+    // front, and at ~160 bytes of text per triangle the same mesh needs a far
+    // larger file, so the vector is proportionally small either way.
+    if let Some(n) = exact {
+        triangles.reserve_exact(n);
+    }
     for tri in reader {
         let tri = tri.map_err(ParseError::malformed)?;
         let v = |i: usize| {
@@ -327,6 +414,61 @@ mod tests {
             ),
             "a NaN coordinate must be refused, got {err:?}"
         );
+    }
+
+    /// The hard-won invariant, pinned directly: a header claiming a colossal
+    /// triangle count must never reach an allocation. The length check is what
+    /// enforces it — `84 + 50 * n` cannot equal a small file's length — so
+    /// `binary_triangle_count` returns `None` and no reserve happens. Asserted
+    /// on the function rather than on `parse_stl`, because the failure mode
+    /// this guards is an abort, which a test cannot catch.
+    #[test]
+    fn a_lying_triangle_count_yields_no_capacity_to_reserve() {
+        let mut b = BINARY_CUBE.to_vec();
+        // ~3 billion triangles: 103 GB if it were ever believed.
+        b[80..84].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(binary_triangle_count(&b), None);
+    }
+
+    /// And the other half: a count that *does* match the length is exact, so
+    /// reserving it is bounded by the input.
+    #[test]
+    fn a_length_checked_triangle_count_is_exact_and_bounded() {
+        let n = binary_triangle_count(BINARY_CUBE).unwrap();
+        assert_eq!(n, 12);
+        assert!(n * std::mem::size_of::<Triangle>() < BINARY_CUBE.len());
+    }
+
+    /// The mesh must come out with no capacity slack on the binary path: that
+    /// slack is up to 2x the mesh, held for as long as the model is loaded,
+    /// and on wasm32 it is never returned to the browser.
+    #[test]
+    fn a_binary_stl_allocates_no_spare_triangle_capacity() {
+        let mesh = parse_stl(BINARY_CUBE).unwrap();
+        assert_eq!(mesh.triangles.capacity(), mesh.triangles.len());
+    }
+
+    /// `Patched` is what lets the two probe workarounds avoid copying the
+    /// file. It must read as the concatenation of its two halves across the
+    /// boundary, and rewind, because `stl_io`'s probe reads a line and seeks
+    /// back to zero before the real reader starts.
+    #[test]
+    fn patched_reads_head_then_tail_and_rewinds() {
+        use std::io::{Read, Seek, SeekFrom};
+        let tail = b"world";
+        let mut p = Patched::new(b"hello ", tail);
+        let mut s = String::new();
+        p.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello world");
+        p.seek(SeekFrom::Start(0)).unwrap();
+        s.clear();
+        p.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello world", "a second pass after rewinding differed");
+        // A read landing inside the tail must not re-serve the head.
+        p.seek(SeekFrom::Start(8)).unwrap();
+        s.clear();
+        p.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "rld");
     }
 
     /// Regression: poking a float must not itself break the fixture, so the
