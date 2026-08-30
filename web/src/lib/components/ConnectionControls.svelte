@@ -32,14 +32,56 @@
     usb: "USB",
     ble: "Bluetooth",
   };
+
+  /**
+   * Keeping focus across the button swap.
+   *
+   * Activating "Connect over USB" removes that very button from the DOM the
+   * moment `connected` flips, so focus falls to <body> and the next Tab
+   * restarts at the top of the page -- with nothing to indicate why. The same
+   * happens on disconnect, and again on an unplug, which the user did not
+   * cause at all.
+   *
+   * So the button that REPLACES the one that went away is focused, but only
+   * when the swap actually took the focus: an unplug while the user is
+   * standing on the scrubber must not yank them over here. `document.body`
+   * counts as "took it", because that is where focus has already landed by the
+   * time the effect runs, and it is also where a device picker leaves it.
+   */
+  let sectionEl: HTMLElement | undefined = $state();
+  let disconnectButton: HTMLButtonElement | undefined = $state();
+  let connectButtons: HTMLButtonElement[] = $state([]);
+
+  let hadFocus = false;
+  let settled = false;
+
+  $effect.pre(() => {
+    // Read so this re-runs on the swap, and read BEFORE the DOM updates --
+    // afterwards the element that had focus no longer exists.
+    void connected;
+    const el = document.activeElement;
+    hadFocus = el === null || el === document.body || !!sectionEl?.contains(el);
+  });
+
+  $effect(() => {
+    void connected;
+    // Never on first render: nothing was swapped out, and stealing focus on
+    // load would drop the user into the middle of the page.
+    if (!settled) {
+      settled = true;
+      return;
+    }
+    if (!hadFocus) return;
+    (connected ? disconnectButton : connectButtons[0])?.focus();
+  });
 </script>
 
-<section aria-labelledby="connection-heading">
+<section bind:this={sectionEl} aria-labelledby="connection-heading">
   <h2 id="connection-heading">Tactile display</h2>
 
   {#if connected}
     <p>Connected to a Dot Pad over {active ? NAMES[active] : "an unknown link"}.</p>
-    <button type="button" onclick={ondisconnect}>
+    <button type="button" bind:this={disconnectButton} onclick={ondisconnect}>
       Disconnect from the Dot Pad over {active ? NAMES[active] : "this link"}
     </button>
   {:else if transports.length > 0}
@@ -48,9 +90,10 @@
       picker is not an error; nothing changes and you can try again.
     </p>
     <p class="buttons">
-      {#each transports as transport (transport)}
+      {#each transports as transport, i (transport)}
         <button
           type="button"
+          bind:this={connectButtons[i]}
           aria-describedby="connect-help"
           onclick={() => onconnect(transport)}
         >

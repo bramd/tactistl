@@ -127,17 +127,22 @@ misleading. A position within the sweep is true under every rotation and view.
 This section is the honest part. Several of these are invisible to the user the
 tool is built for, which is exactly why they are written down.
 
-**No delivery confirmation for graphic frames.** The SDK's `displayGraphicData`
-is a synchronous, fire-and-forget void call, so the app cannot tell whether a
-frame actually reached the device. If a write fails silently inside the SDK,
-the display simply holds the previous layer — and for a blind user a stale
-frame is indistinguishable from geometry that genuinely did not change. The
-sink latches and reports the write errors it *can* see (a throw, or a write
-that does not settle within five seconds), but a silent failure below that is
-invisible. The SDK does emit `ResponseDisplayLineAck`,
-`ResponseDisplayLineNonAck` and `ResponseDisplayLineComplete` data codes
-through the message callback the sink already wires up for disconnects.
-Subscribing to those is the highest-value follow-up in this file.
+**No delivery confirmation for anything sent to the display.** Neither the dot
+frames nor the text line are acknowledged. `displayGraphicData` is a
+synchronous, fire-and-forget void call; `displayTextData` returns a promise,
+but with `needsTranslation=false` — the only mode this app uses, because `true`
+dynamically imports liblouis, which is not shipped — it resolves as soon as the
+data is handed on, without waiting for the device. So the app cannot tell
+whether a frame *or* a position line actually reached the hardware. If a write
+fails silently inside the SDK, the display simply holds the previous layer —
+and for a blind user a stale frame is indistinguishable from geometry that
+genuinely did not change. The sink latches and reports the write errors it
+*can* see (a throw, or a write that does not settle within five seconds), but a
+silent failure below that is invisible. The SDK does emit
+`ResponseDisplayLineAck`, `ResponseDisplayLineNonAck` and
+`ResponseDisplayLineComplete` data codes through the message callback the sink
+already wires up for disconnects. Subscribing to those is the highest-value
+follow-up in this file.
 
 **A failed final frame is not retried.** `LatestWinsQueue` coalesces
 submissions so a slider drag does not queue one render per pixel of travel, but
@@ -154,9 +159,9 @@ reading), while `viewChanged` re-centres (because a fraction through the
 model's Z means nothing along its Y). There is no type distinction, so calling
 the wrong one produces no error at all — just a scrubber that jumps when it
 should hold, or holds when it should jump. It is contained to two call sites in
-`App.svelte` today, passed explicitly rather than inferred. The durable fix is
-for the store to own the distinction by comparing the view the bounds were
-fetched under, rather than trusting the caller.
+`App.svelte` today, one per method. The durable fix is for the store to own the
+distinction by comparing the view the bounds were fetched under, rather than
+trusting the caller.
 
 **The canvas preview is fixed at 60x40.** `CanvasPreviewSink` takes its grid at
 construction and has no setter, so if a connected device reports different
@@ -269,6 +274,12 @@ use `crates/core/tests/fixtures/cube_ascii.stl` as the first model.
 - [ ] **The focus ring is visible on every control** — file input, all three
       rotation fields, the view select, both checkboxes, the slider, the exact
       position field, and every connection button. Tab through the whole page.
+- [ ] **Connecting with a model already loaded.** Load a model first, then
+      connect. The pins must change and the text line must show a position
+      *before you touch any control*. On an A320 the device's grid is 60x40 —
+      exactly the disconnected fallback — so nothing about the render changes
+      on connect, and only the connect itself can force that first frame. The
+      grid-adoption item below would not catch this.
 - [ ] **Grid adoption.** With a device attached, confirm the frame is
       rasterized at the device's reported cell counts, not at the 60x40
       fallback.

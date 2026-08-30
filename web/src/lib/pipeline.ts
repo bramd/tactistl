@@ -8,6 +8,7 @@
  * without moving the on-screen slider, so there is deliberately no second path
  * from an input to a sink.
  */
+import { get } from "svelte/store";
 import type { Bitmap, TactileSink } from "./tactile/types";
 import type { RenderRequest } from "./geometry/client";
 import type { ViewerState, ViewerStore } from "./store";
@@ -92,9 +93,66 @@ export function startPipeline(
   );
 
   let lastKey: string | null = null;
+  // Declared before the state subscription: the connect transition below pushes
+  // the current label directly, so both writers have to see the same variable.
+  let lastLabel: string | null = null;
+  let lastConnected = false;
+  let stopped = false;
 
-  const stopState = store.subscribe((s) => {
+  /**
+   * The one place that writes the text line, so the "do not repeat a line the
+   * fingers are already resting on" guard cannot be half-applied.
+   */
+  const sendLabel = (label: string): void => {
+    if (label === lastLabel) return;
+    lastLabel = label;
+    // The empty label means there are no bounds yet -- nothing to announce.
+    if (label === "") return;
+    for (const sink of sinks) sink.renderText(label);
+  };
+
+  /**
+   * A whole synchronous burst of store writes collapses into one render.
+   *
+   * A store write notifies subscribers immediately and one at a time, so two
+   * writes that only make sense together -- the view and the bounds that view
+   * was measured under -- are observed here as an intermediate state that never
+   * existed as far as the user is concerned. Rendering it costs a real frame on
+   * hardware: roughly a second of pin actuation showing a cross-section taken
+   * at a plane outside the new extent, i.e. a blank plate, before the correct
+   * frame arrives. Deferring by a microtask means the caller's writes have all
+   * landed before anything is rasterized.
+   */
+  let latest: ViewerState | null = null;
+  let flushQueued = false;
+
+  const flush = (): void => {
+    flushQueued = false;
+    const s = latest;
+    latest = null;
+    if (stopped || !s) return;
+
+    // A connect (or a drop) has to invalidate BOTH caches. The grid a real
+    // A320 reports is byte-identical to the fallback rasterized against while
+    // disconnected, so the render key does not change on its own and nothing
+    // would ever be sent; and the label was already emitted to a sink that was
+    // dropping writes on the floor, so it has to be re-issued too.
+    const connectionChanged = s.connected !== lastConnected;
+    if (connectionChanged) {
+      lastConnected = s.connected;
+      lastKey = null;
+      lastLabel = null;
+    }
+
     if (!s.modelLoaded || !s.bounds) return;
+
+    // Pushed rather than left to the label subscription: that store is derived,
+    // and a derived store suppresses a value equal to the one it already holds.
+    // Clearing `lastLabel` alone would therefore do nothing until the position
+    // next moved, which is the user having to touch a control to get the line
+    // they just connected for.
+    if (connectionChanged) sendLabel(get(store.axisLabel));
+
     // Read the grid per submission, never snapshotted at startup: a sink's grid
     // changes when a device connects and reports its own cell counts, and the
     // `connected` flip is what brings us back here to notice.
@@ -104,21 +162,23 @@ export function startPipeline(
     if (key === lastKey) return;
     lastKey = key;
     queue.submit(req);
+  };
+
+  const stopState = store.subscribe((s) => {
+    latest = s;
+    if (flushQueued) return;
+    flushQueued = true;
+    queueMicrotask(flush);
   });
 
   // Svelte already suppresses an unchanged primitive, but the guard is stated
-  // here rather than relied on: the label goes to a braille text line, and a
-  // repeat of it under the user's fingers reads as something having changed.
-  let lastLabel: string | null = null;
-  const stopLabel = store.axisLabel.subscribe((label) => {
-    if (label === lastLabel) return;
-    lastLabel = label;
-    // The empty label means there are no bounds yet -- nothing to announce.
-    if (label === "") return;
-    for (const sink of sinks) sink.renderText(label);
-  });
+  // in `sendLabel` rather than relied on: the label goes to a braille text
+  // line, and a repeat of it under the user's fingers reads as something having
+  // changed.
+  const stopLabel = store.axisLabel.subscribe(sendLabel);
 
   return () => {
+    stopped = true;
     stopState();
     stopLabel();
   };

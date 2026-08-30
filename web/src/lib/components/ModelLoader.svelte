@@ -13,7 +13,15 @@
    * element pretending to be interactive for a screen reader to trip over.
    */
   interface Props {
-    /** True while a load is in flight; the input is disabled so two cannot race. */
+    /**
+     * True while a load is in flight, so a drop landing mid-parse is ignored.
+     *
+     * It deliberately does NOT disable the file input. Disabling the element
+     * the user is standing on drops focus to <body>, and a large STL takes
+     * seconds -- so the most repeated interaction in the app would throw the
+     * user back to the top of the page on every use. The parent guards
+     * re-entrancy on its own state instead.
+     */
     busy: boolean;
     /** Handed the chosen file. The parent owns the parse and all error reporting. */
     onfile: (file: File) => void;
@@ -56,7 +64,6 @@
       type="file"
       accept=".stl,model/stl,application/sla"
       aria-describedby="model-help"
-      disabled={busy}
       onchange={(e) => {
         const input = e.currentTarget;
         const file = first(input.files);

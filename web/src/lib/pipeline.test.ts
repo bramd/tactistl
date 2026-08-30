@@ -89,6 +89,7 @@ describe("startPipeline", () => {
     const stop = startPipeline(store, g.client, [a, b]);
 
     store.onModelLoaded(12, B);
+    await flush();
     g.release();
     await flush();
 
@@ -121,10 +122,12 @@ describe("startPipeline", () => {
     const stop = startPipeline(store, g.client, [sink]);
 
     store.onModelLoaded(12, B);
+    await flush();
     expect(g.requests).toHaveLength(1);
 
     // 40 scrubber positions while the first render is still in flight.
     for (let i = 1; i <= 40; i++) store.setAxisPos(i);
+    await flush();
     expect(g.requests).toHaveLength(1);
 
     g.release();
@@ -143,6 +146,7 @@ describe("startPipeline", () => {
     const stop = startPipeline(store, g.client, [new FakeSink()]);
 
     store.onModelLoaded(12, B);
+    await flush();
     g.release();
     await flush();
 
@@ -153,6 +157,7 @@ describe("startPipeline", () => {
     store.setMirror(true);
     store.setFilled(true);
     store.setAxisPos(7);
+    await flush();
     g.release();
     await flush();
     g.release();
@@ -176,6 +181,7 @@ describe("startPipeline", () => {
     ]);
 
     store.onModelLoaded(12, B);
+    await flush();
     g.release();
     await flush();
 
@@ -190,6 +196,7 @@ describe("startPipeline", () => {
     const stop = startPipeline(store, g.client, []);
 
     store.onModelLoaded(12, B);
+    await flush();
     g.release();
     await flush();
 
@@ -205,17 +212,80 @@ describe("startPipeline", () => {
     const stop = startPipeline(store, g.client, [sink]);
 
     store.onModelLoaded(12, B);
+    await flush();
     g.release();
     await flush();
 
     sink.grid = { width: 40, height: 20 };
     store.setConnected(true);
+    await flush();
     g.release();
     await flush();
 
     expect(g.requests).toHaveLength(2);
     expect(g.requests[1].width).toBe(40);
     expect(g.requests[1].height).toBe(20);
+    stop();
+  });
+
+  it("sends a frame and re-sends the text line when a connect leaves the grid unchanged", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    // 60x40 -- byte-identical to the disconnected fallback, which is exactly
+    // what a real Dot Pad A320 reports. Nothing about the render request
+    // changes on connect, so only the connect transition itself can force the
+    // first frame the device ever receives.
+    const sink = new FakeSink(60, 40);
+    const stop = startPipeline(store, g.client, [sink]);
+
+    store.onModelLoaded(12, B);
+    await flush();
+    g.release();
+    await flush();
+    expect(g.requests).toHaveLength(1);
+    expect(sink.texts).toEqual(["20.0 of 40.0 mm"]);
+
+    store.setConnected(true);
+    await flush();
+    g.release();
+    await flush();
+
+    // The frame: everything before the connect went nowhere, because the sink
+    // was dropping writes while disconnected.
+    expect(g.requests).toHaveLength(2);
+    expect(g.requests[1]).toEqual(g.requests[0]);
+    expect(sink.frames).toHaveLength(2);
+    // And the text line, which is a separate cache and breaks on every device.
+    expect(sink.texts).toEqual(["20.0 of 40.0 mm", "20.0 of 40.0 mm"]);
+    stop();
+  });
+
+  it("renders once for a view and its bounds written back to back", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    const sink = new FakeSink();
+    const stop = startPipeline(store, g.client, [sink]);
+
+    store.onModelLoaded(12, B);
+    await flush();
+    g.release();
+    await flush();
+    expect(g.requests).toHaveLength(1);
+
+    // What `App.svelte`'s `onView` does once the new view's bounds are in
+    // hand. The intermediate state -- new view, old sweep's position -- must
+    // never reach the device: on hardware it is a second of pin actuation
+    // showing a plane outside the new extent, i.e. a blank plate.
+    store.setView(ViewAxis.Front);
+    store.viewChanged(box([-5, -5, 0], [5, 5, 100]));
+    await flush();
+    g.release();
+    await flush();
+
+    expect(g.requests).toHaveLength(2);
+    expect(g.requests[1].view).toBe(ViewAxis.Front);
+    expect(g.requests[1].z).toBe(50);
+    expect(sink.frames).toHaveLength(2);
     stop();
   });
 
@@ -256,6 +326,7 @@ describe("startPipeline", () => {
     const stop = startPipeline(store, g.client, [new FakeSink()]);
 
     store.onModelLoaded(12, B);
+    await flush();
     g.release();
     await flush();
     expect(g.requests).toHaveLength(1);
@@ -301,6 +372,7 @@ describe("startPipeline", () => {
     const stop = startPipeline(store, g.client, [sink]);
 
     store.onModelLoaded(12, B);
+    await flush();
     g.release();
     await flush();
     const renders = g.requests.length;

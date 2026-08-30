@@ -71,7 +71,7 @@ const PUNCTUATION: Record<string, number> = {
 
 /**
  * A minimal uncontracted-braille renderer for the short axis labels this app
- * emits (for example "Z 12.4 mm"). It covers letters, digits, and the few
+ * emits (for example "12.4 of 40.0 mm"). It covers letters, digits, and the few
  * punctuation marks those labels use — nothing more.
  *
  * It exists so the app does not have to ship liblouis (several megabytes of

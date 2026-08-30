@@ -66,7 +66,12 @@
 
   async function loadFile(file: File): Promise<void> {
     const client = geometry;
-    if (!client) return;
+    // Re-entrancy is guarded on the state, not by disabling the file input:
+    // disabling the element the user is standing on drops focus to <body>, and
+    // for a 50 MB STL that is seconds with no focus at all -- on the single
+    // most repeated interaction in the app. The drop handler guards the same
+    // way, so both entry points behave alike.
+    if (!client || viewer.snapshot().busy) return;
     viewer.setBusy(true);
     try {
       // `parse` transfers the buffer, so it is read fresh from the File and
@@ -87,15 +92,16 @@
   }
 
   /**
-   * Re-fetch the rotated extent and hand it to the store.
+   * The two store methods below take the same argument and differ only in what
+   * they do to the reading position, so choosing the wrong one produces no
+   * error of any kind -- just a scrubber that jumps when it should hold, or
+   * holds when it should jump. There are exactly two call sites, both here.
    *
-   * `kind` picks between two store methods that take the same argument and
-   * differ only in what they do to the reading position, so getting it wrong
-   * produces no error of any kind -- just a scrubber that jumps when it should
-   * hold. It is passed explicitly, from exactly two call sites below, rather
-   * than inferred from anything.
+   * ROTATION: `boundsChanged` PRESERVES the reading position as a fraction of
+   * the extent. Nudging the rotation a degree to compare must not throw away
+   * the plane being read.
    */
-  async function refreshBounds(kind: "rotation" | "view"): Promise<void> {
+  async function refreshBounds(): Promise<void> {
     const client = geometry;
     const s = viewer.snapshot();
     if (!client || !s.modelLoaded) return;
@@ -106,16 +112,7 @@
         s.view,
       );
       if (token !== latestBounds) return;
-      if (kind === "rotation") {
-        // ROTATION: `boundsChanged` PRESERVES the reading position as a
-        // fraction of the extent. Nudging the rotation a degree to compare
-        // must not throw away the plane being read.
-        viewer.boundsChanged(bounds);
-      } else {
-        // VIEW: `viewChanged` RE-CENTRES. Top to Front swaps the sweep onto an
-        // unrelated extent, so carrying a fraction across would be meaningless.
-        viewer.viewChanged(bounds);
-      }
+      viewer.boundsChanged(bounds);
     } catch (e) {
       fail(e);
     }
@@ -123,12 +120,43 @@
 
   function onRotate(axis: "x" | "y" | "z", degrees: number): void {
     viewer.setRotation(axis, degrees);
-    void refreshBounds("rotation");
+    void refreshBounds();
   }
 
-  function onView(view: ViewAxisValue): void {
-    viewer.setView(view);
-    void refreshBounds("view");
+  /**
+   * A view change, applied only once its own bounds are in hand.
+   *
+   * The view is deliberately NOT written to the store first. Writing it alone
+   * leaves the store holding the new view against the old sweep's position --
+   * a plane from an unrelated extent, which renders blank -- and the pipeline
+   * wakes on that write. On hardware every frame is roughly a second of
+   * mechanical pin actuation, so the user would feel a blank plate, then the
+   * real cross-section, with no way to tell which was real.
+   *
+   * So the bounds are fetched for the REQUESTED view, and only then are the
+   * two writes made back to back with nothing awaited between them. The
+   * pipeline collapses a synchronous burst of writes into one render, so the
+   * device only ever feels the consistent state.
+   *
+   * VIEW: `viewChanged` RE-CENTRES. Top to Front swaps the sweep onto an
+   * unrelated extent, so carrying a fraction across would be meaningless.
+   */
+  async function onView(view: ViewAxisValue): Promise<void> {
+    const client = geometry;
+    const s = viewer.snapshot();
+    if (!client || !s.modelLoaded) return;
+    const token = ++latestBounds;
+    try {
+      const bounds = await client.bounds(
+        [s.rotation.x, s.rotation.y, s.rotation.z],
+        view,
+      );
+      if (token !== latestBounds) return;
+      viewer.setView(view);
+      viewer.viewChanged(bounds);
+    } catch (e) {
+      fail(e);
+    }
   }
 
   /**
@@ -262,7 +290,7 @@
       mirror={$viewer.mirror}
       filled={$viewer.filled}
       disabled={!$viewer.modelLoaded || $viewer.busy}
-      onview={onView}
+      onview={(v) => void onView(v)}
       onmirror={viewer.setMirror}
       onfilled={viewer.setFilled}
     />

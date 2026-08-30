@@ -60,31 +60,42 @@
     a position measured along one direction means nothing along another.
   </p>
 
+  <!--
+    Short label, explanation in a described-by paragraph, the same shape as the
+    help text beside the select above. A <label> holding two sentences becomes
+    the accessible NAME, so the whole explanation is spoken on arrival, on every
+    Tab pass, and in the elements list. The prose is worth keeping; it just
+    belongs in the description slot.
+  -->
   <p class="field">
     <input
       id="view-mirror"
       type="checkbox"
+      aria-describedby="mirror-help"
       checked={mirror}
       onchange={(e) => onmirror(e.currentTarget.checked)}
     />
-    <label for="view-mirror">
-      Mirror &mdash; view from the opposite side. This is how Back and Left are
-      offered: the cross-section is identical, only the viewing direction is
-      reversed.
-    </label>
+    <label for="view-mirror">Mirror</label>
+  </p>
+
+  <p id="mirror-help">
+    View from the opposite side. This is how Back and Left are offered: the
+    cross-section is identical, only the viewing direction is reversed.
   </p>
 
   <p class="field">
     <input
       id="view-filled"
       type="checkbox"
+      aria-describedby="filled-help"
       checked={filled}
       onchange={(e) => onfilled(e.currentTarget.checked)}
     />
-    <label for="view-filled">
-      Filled &mdash; fill the cross-section. With this off you feel the outline
-      only.
-    </label>
+    <label for="view-filled">Fill the cross-section</label>
+  </p>
+
+  <p id="filled-help">
+    With this off you feel the outline only.
   </p>
 </fieldset>
 
