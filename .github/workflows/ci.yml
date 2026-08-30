@@ -11,13 +11,6 @@ on:
 permissions:
   contents: read
 
-# One Pages deployment at a time. `cancel-in-progress: false` because a
-# half-finished deploy that gets cancelled leaves the site on the previous
-# version; letting each one finish is cheaper than reasoning about that.
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
   build-test:
     name: Build and test
@@ -94,6 +87,16 @@ jobs:
     permissions:
       pages: write
       id-token: write
+    # Deployments serialize; builds do not. Scoping this to the deploy job
+    # rather than the workflow matters because `build-test` also runs on every
+    # pull request, and a workflow-level group would queue unrelated PR builds
+    # behind each other -- and cancel the queued one as soon as a third
+    # arrived, showing as a failed check on a PR that was fine.
+    # `cancel-in-progress: false`: a cancelled half-deploy leaves the site on
+    # the previous version, so letting each finish is the simpler behaviour.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
