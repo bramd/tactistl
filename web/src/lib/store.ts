@@ -97,7 +97,12 @@ export interface ViewerStore extends Readable<ViewerState> {
   /** Map a Dot Pad key to a scrub. Unmapped keys are ignored. */
   handleDeviceKey(keyCode: string): void;
   setBusy(busy: boolean): void;
-  /** Record a failure. Never unloads the model: a bad new file leaves the old one usable. */
+  /**
+   * Record a failure, or clear one with `null`. Either way the work that was
+   * in flight is over, so this also clears `busy`.
+   *
+   * Never unloads the model: a bad new file leaves the old one usable.
+   */
   setError(error: string | null): void;
   setConnected(connected: boolean): void;
   snapshot(): ViewerState;
@@ -188,7 +193,12 @@ export function createViewerStore(): ViewerStore {
   };
 
   const setError = (error: string | null): void => {
-    update((s) => ({ ...s, error }));
+    // Clearing `busy` here rather than at each call site: an error IS the end
+    // of whatever was in flight, and there is no failure path that wants the
+    // app left saying it is still working. Leaving it to callers is how one of
+    // them eventually forgets, and the symptom -- controls disabled forever
+    // with no visible cause -- is not one this app's user can see.
+    update((s) => ({ ...s, error, busy: false }));
   };
 
   const setConnected = (connected: boolean): void => {

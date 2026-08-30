@@ -92,7 +92,7 @@ let mesh: MeshHandle | null = null;
  * Without this, two `parse` messages arriving back to back would both suspend
  * at the `await` for WASM init and resume interleaved, and the ownership of
  * `mesh` — who frees which handle — would depend on microtask ordering. Serial
- * execution makes "free the old handle, then take the new one" a single
+ * execution makes "take the new handle, then free the old one" a single
  * indivisible step, so a handle is never freed twice and a live handle is
  * never freed.
  */
@@ -115,14 +115,24 @@ async function handle(req: GeometryRequest): Promise<void> {
     await ensureReady();
     switch (req.kind) {
       case "parse": {
-        // Free BEFORE parsing: wasm32 linear memory only ever grows, so
-        // holding both meshes at once would raise the module's high-water mark
-        // permanently. Nulling first also means a failed parse leaves no
-        // dangling freed handle for the next request to free again.
-        mesh?.free();
-        mesh = null;
+        // Parse into a temporary, and only free the old handle once the new
+        // one exists. A failed parse therefore throws before anything is
+        // released, leaving the previously loaded model live and renderable.
+        //
+        // The cost is deliberate: on the SUCCESS path both meshes are briefly
+        // resident, and wasm32 linear memory only ever grows, so the module's
+        // high-water mark is set by the largest pair rather than the largest
+        // single mesh and never comes back down. Freeing first would avoid
+        // that, at the price of destroying the loaded model every time a parse
+        // fails -- and this app exists for a user who cannot glance at a file
+        // picker to check they grabbed the right file. An app that survives a
+        // fumbled selection is worth more than a lower ceiling, and print STLs
+        // run to tens of megabytes, not hundreds.
         const parsed = parse_stl(new Uint8Array(req.bytes));
+        // Past the throwing call: from here the swap cannot fail partway.
+        const previous = mesh;
         mesh = parsed;
+        previous?.free();
         reply({ id: req.id, ok: true, value: parsed.triangle_count });
         return;
       }

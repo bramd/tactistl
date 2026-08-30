@@ -268,10 +268,30 @@ describe("createViewerStore", () => {
     expect(s.snapshot().error).toBeNull();
   });
 
+  it("clears busy when an error is recorded", () => {
+    const s = createViewerStore();
+    s.setBusy(true);
+    s.setError("the file could not be read");
+    // An error ends the work that was in flight. If `busy` survived it, the
+    // controls it gates would stay disabled with nothing left to re-enable
+    // them -- and no call site would have to have got anything wrong for that
+    // to happen.
+    expect(s.snapshot().busy).toBe(false);
+  });
+
+  it("clears busy when an error is dismissed", () => {
+    const s = createViewerStore();
+    s.setBusy(true);
+    s.setError(null);
+    expect(s.snapshot().busy).toBe(false);
+  });
+
   it("tracks busy and connected flags", () => {
     const s = createViewerStore();
     s.setBusy(true);
     expect(s.snapshot().busy).toBe(true);
+    s.setBusy(false);
+    expect(s.snapshot().busy).toBe(false);
     s.setConnected(true);
     expect(s.snapshot().connected).toBe(true);
     s.setMirror(true);

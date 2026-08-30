@@ -56,9 +56,11 @@
     return e instanceof Error ? e.message : String(e);
   }
 
-  /** `setError` deliberately does not clear `busy`, so both are set together. */
+  /**
+   * The one way a failure reaches the user. `setError` clears `busy` itself,
+   * so there is nothing to remember to pair with it here.
+   */
   function fail(e: unknown): void {
-    viewer.setBusy(false);
     viewer.setError(message(e));
   }
 
@@ -302,19 +304,9 @@
 
 <style>
   main {
-    text-align: left;
     max-width: 60rem;
     margin: 0 auto;
     padding: 1rem 1.5rem 4rem;
-  }
-  main :global(h1) {
-    font-size: 2rem;
-    letter-spacing: normal;
-    margin: 1rem 0 0.5rem;
-  }
-  main :global(h2) {
-    font-size: 1.25rem;
-    margin: 1.5rem 0 0.5rem;
   }
   .lede {
     max-width: 46rem;
