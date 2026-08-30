@@ -1,0 +1,6 @@
+# STL fixtures are byte-exact test data. The parser distinguishes ASCII from
+# binary by exact length and exact header bytes, and tests assert on those
+# bytes directly, so line-ending conversion silently breaks them: with
+# core.autocrlf=true a fresh Windows clone turns "solid\n" into "solid\r\n"
+# and the empty-solid-name test fails.
+*.stl -text
