@@ -5,8 +5,9 @@ use crate::vec::Vec2;
 /// columns, so row counts are scaled up by this factor.
 ///
 /// The Dot Pad's graphic area is assumed to have square pin pitch; verify
-/// against hardware by slicing a sphere at mid-height and checking the circle
-/// does not feel elliptical, then adjust here if needed.
+/// against hardware by loading `models/calibration-sphere-20mm.stl` and
+/// checking the mid-height circle does not feel elliptical, then adjust here
+/// if needed. The README's notes on the device carry the full procedure.
 pub const PIN_ASPECT: f32 = 1.0;
 
 /// Maps model XY into grid coordinates: aspect-preserving, centred, with the

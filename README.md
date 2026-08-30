@@ -300,9 +300,42 @@ mode, so the boundary still comes through on those rows.
 
 **`PIN_ASPECT` is assumed to be 1.0 and has not been verified against
 hardware.** The rasterizer assumes the graphic area's pin pitch is square. If
-it is not, circles will feel slightly elliptical. `crates/core/src/raster/fit.rs`
-carries the calibration procedure: slice a sphere at mid-height, feel whether
-the circle is round, adjust the constant.
+it is not, circles will feel slightly elliptical. The constant lives in
+`crates/core/src/raster/fit.rs`, and `models/calibration-sphere-20mm.stl` is
+there to settle it.
+
+That model is a sphere of radius 20 mm — 40 mm across — centred exactly on the
+origin, 4096 triangles. It is smooth enough that no facet deviates from a true
+circle by more than about 2% of one dot, so what you feel is the pin pitch and
+nothing else. Regenerate it with
+`cargo run --example make_calibration_sphere`.
+
+**To calibrate**, load it and change nothing else: rotation zero, Top view and
+the scrubber at the middle are the defaults, and that slice is the equator, the
+model's widest cross-section. You should feel a circle **40 dots across and 40
+dots tall** — it fills the display's full height, with ten blank columns either
+side. The equator sits in the middle of a band of facets that all have the same
+radius, so any scrubber position within about 2 mm of centre gives the same
+circle — it does not have to be exact.
+
+Then read the shape:
+
+- **Wider than tall** — the pins are further apart horizontally than
+  vertically, so pin width over pin height exceeds 1. Raise `PIN_ASPECT`
+  above 1.0.
+- **Taller than wide** — lower it below 1.0.
+- For a first value, use the width you felt divided by the height you felt.
+  That ratio *is* the pin aspect: at `PIN_ASPECT = 1.0` a physically square
+  model is drawn with equal dot counts on both axes, so its felt width over
+  felt height comes out as pin width over pin height.
+
+The constant multiplies the model's height when the fit converts millimetres
+into dots, so raising it spends proportionally more rows per millimetre and
+therefore fewer columns, narrowing the drawing to compensate for wide pins.
+
+Changing it needs the WASM rebuilt, so run `cargo test` and then restart the
+app with `npm run dev` (which runs `build:wasm` first) — a plain page reload
+will still be using the old module.
 
 **The braille text-line renderer is a deliberate subset.** `SimpleBrailleRenderer`
 handles uncontracted letters, digits, space, `.`, `,` and `-` — enough for the
