@@ -106,7 +106,7 @@ export interface ViewerStore extends Readable<ViewerState> {
   setError(error: string | null): void;
   setConnected(connected: boolean): void;
   snapshot(): ViewerState;
-  /** e.g. `"Z 12.4 mm"`; empty until there are bounds. */
+  /** e.g. `"12.4 of 40.0 mm"`; empty until there are bounds. */
   axisLabel: Readable<string>;
 }
 
