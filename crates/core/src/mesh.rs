@@ -1,5 +1,24 @@
 use crate::vec::{Bbox3, Vec3};
 
+/// "This file is not readable as an STL, and there is nothing specific to say
+/// about why."
+///
+/// A `const` rather than a literal because the WASM boundary refuses some
+/// inputs before a parser is ever built — a `File.size` that is negative,
+/// fractional or not a number — and must say the same thing. These sentences
+/// are read aloud by a screen reader, so two copies drifting apart is a defect
+/// the user hears, not untidiness. `crates/wasm` may depend on `core`; the
+/// reverse would not be, so the definition lives here.
+pub const MSG_UNREADABLE: &str = "this STL file could not be read";
+
+/// "This STL is real, but bigger than we can hold."
+///
+/// Shared for the same reason, and shared *deliberately* between the refusals
+/// that differ only in mechanism: a length too big to be a `usize` at all, and
+/// a verified triangle count whose mesh would not fit. The listener can do
+/// exactly one thing about either, so they get one sentence.
+pub const MSG_TOO_LARGE: &str = "this STL file is too large to open";
+
 #[derive(Debug, Clone, Copy)]
 pub struct Triangle {
     pub v: [Vec3; 3],
@@ -53,7 +72,7 @@ impl std::fmt::Display for ParseError {
                 std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData => {
                     write!(f, "this does not look like an STL file, or it is incomplete")
                 }
-                _ => write!(f, "this STL file could not be read"),
+                _ => write!(f, "{MSG_UNREADABLE}"),
             },
             ParseError::NoGeometry => write!(f, "the file contains no triangles"),
             ParseError::NonFinite => write!(f, "this STL contains invalid coordinates"),
@@ -62,7 +81,7 @@ impl std::fmt::Display for ParseError {
             // mechanism, not in anything the listener can do about it, and one
             // clear sentence beats two that are nearly the same. Nothing about
             // megabytes or linear memory belongs in text read aloud.
-            ParseError::TooLarge => write!(f, "this STL file is too large to open"),
+            ParseError::TooLarge => write!(f, "{MSG_TOO_LARGE}"),
         }
     }
 }
@@ -1255,6 +1274,26 @@ mod tests {
         let triangles = MESH_BUDGET_BYTES / std::mem::size_of::<Triangle>();
         assert_eq!(triangles, 52_195_783);
         assert_eq!(84 + 50 * triangles as u64, 2_609_789_234);
+    }
+
+    // --- one sentence, one definition -----------------------------------
+
+    /// The two sentences the WASM boundary also uses are `const`s in this
+    /// crate, and `Display` renders those same `const`s rather than a second
+    /// copy of the words. A screen reader reads these aloud, so two copies
+    /// drifting apart is a defect the user hears, not untidiness.
+    #[test]
+    fn the_shared_messages_are_what_display_renders() {
+        assert_eq!(ParseError::TooLarge.to_string(), MSG_TOO_LARGE);
+        let unreadable = ParseError::Malformed {
+            kind: std::io::ErrorKind::Other,
+            detail: "anything at all".into(),
+        };
+        assert_eq!(unreadable.to_string(), MSG_UNREADABLE);
+        // And they are still the sentences that were agreed, not merely equal
+        // to whatever the constants happen to say today.
+        assert_eq!(MSG_TOO_LARGE, "this STL file is too large to open");
+        assert_eq!(MSG_UNREADABLE, "this STL file could not be read");
     }
 
     /// A zero-length push is legal and must change nothing — a `ReadableStream`

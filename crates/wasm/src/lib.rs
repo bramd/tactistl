@@ -112,11 +112,17 @@ impl StlStream {
         // On wasm32 `usize` is 32-bit, so anything at or above 4 GiB cannot be
         // a length here at all; and a negative, fractional or non-finite value
         // is a caller bug, not a file we should try to read.
+        //
+        // The sentences come from `core` rather than being written out here.
+        // They are the same ones `ParseError` displays, they are read aloud by
+        // a screen reader, and a copy in each crate is a copy that eventually
+        // stops matching. This crate already depends on `core`, so the shared
+        // definition costs nothing.
         if !total_len.is_finite() || total_len < 0.0 || total_len.fract() != 0.0 {
-            return Err(JsError::new("this STL file could not be read"));
+            return Err(JsError::new(mesh::MSG_UNREADABLE));
         }
         if total_len > usize::MAX as f64 {
-            return Err(JsError::new("this STL file is too large to open"));
+            return Err(JsError::new(mesh::MSG_TOO_LARGE));
         }
         Ok(StlStream {
             inner: Some(mesh::StreamParser::new(total_len as usize)),
@@ -128,7 +134,7 @@ impl StlStream {
         let parser = self
             .inner
             .as_mut()
-            .ok_or_else(|| JsError::new("this STL file could not be read"))?;
+            .ok_or_else(|| JsError::new(mesh::MSG_UNREADABLE))?;
         parser.push(chunk).map_err(|e| JsError::new(&e.to_string()))
     }
 
@@ -138,7 +144,7 @@ impl StlStream {
         let parser = self
             .inner
             .take()
-            .ok_or_else(|| JsError::new("this STL file could not be read"))?;
+            .ok_or_else(|| JsError::new(mesh::MSG_UNREADABLE))?;
         match parser.finish() {
             Ok(mesh) => Ok(MeshHandle { mesh }),
             Err(e) => Err(JsError::new(&e.to_string())),
