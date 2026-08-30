@@ -313,6 +313,17 @@ bytes as text, so nobody ships large ASCII STLs, and every file that has
 actually caused an out-of-memory is binary. If that ever stops being true, the
 fix is a real incremental ASCII reader, not a change to the streaming plumbing.
 
+Because that path buffers the whole file, it carries its own ceiling: 768 MiB
+of file, roughly 3.2 million triangles at real ASCII densities and the same
+geometry a 161 MB binary STL holds. Anything larger is refused with "this STL
+file is too large to open". The ceiling applies to whatever is not an
+exact-length binary STL, so a truncated download or a padded export of a huge
+binary file lands here too — which is the point, since those are the realistic
+ways a multi-gigabyte file reaches the ASCII fallback. The binary ceiling is
+separate and much higher: about 2.61 GB, set by the mesh rather than the file.
+Both refusals say a sentence; before them, the allocation aborted the WASM
+module outright, which a user who cannot see the page experiences as silence.
+
 **Reloading a model briefly holds two meshes.** The worker parses into a
 temporary and only frees the old handle once the new one exists, so a failed
 parse leaves the previously loaded model live and renderable — which matters
