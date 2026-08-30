@@ -157,6 +157,21 @@ mod tests {
         let filled = render(&cube(), &p);
         p.filled = false;
         let outline = render(&cube(), &p);
+
+        // Without these two guards the loop below asserts nothing when the
+        // outline renders empty, and a size mismatch would panic on an index
+        // or silently leave a tail unchecked rather than failing as itself.
+        assert_eq!(
+            (outline.width, outline.height),
+            (filled.width, filled.height),
+            "the two renders must be the same size to compare dot for dot"
+        );
+        assert!(
+            outline.count_set() > 0,
+            "the outline render was empty, so the superset check below would \
+             pass without comparing anything"
+        );
+
         for i in 0..filled.data.len() {
             if outline.data[i] == 1 {
                 assert_eq!(filled.data[i], 1, "outline dot {i} missing from the fill");
