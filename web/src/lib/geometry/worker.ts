@@ -120,10 +120,13 @@ async function handle(req: GeometryRequest): Promise<void> {
     switch (req.kind) {
       case "parse": {
         // Stream the file into the parser instead of handing WASM one big
-        // slice. A `parse_stl(bytes)` call needs the whole file resident twice
+        // slice. A whole-buffer entry point would need the file resident twice
         // over -- the JS buffer plus wasm-bindgen's copy into linear memory --
         // and wasm32 memory is never returned to the browser, so both copies
-        // are a permanent cost. Chunks cost one chunk.
+        // are a permanent cost. Chunks cost one chunk. That is why no such
+        // export exists: wasm-bindgen makes its copy before any Rust code, and
+        // therefore any budget check, can run, so an oversized input aborts the
+        // module outright instead of being refused with a sentence.
         //
         // `StlStream` is a WASM heap object, so it must be freed on EVERY
         // path. The `finally` covers a rejected parse and a stream that throws

@@ -72,21 +72,6 @@ impl MeshHandle {
     }
 }
 
-/// Parse STL bytes. Rejects with a JS `Error` carrying a human-readable
-/// message suitable for showing in the UI.
-///
-/// Kept for the whole-buffer case and for tests. The app itself uses
-/// `StlStream`, because calling this from JavaScript requires the file to
-/// exist twice — once as the JS `ArrayBuffer` and once as wasm-bindgen's copy
-/// of it into linear memory — and on wasm32 neither copy is ever given back.
-#[wasm_bindgen]
-pub fn parse_stl(bytes: &[u8]) -> Result<MeshHandle, JsError> {
-    match mesh::parse_stl(bytes) {
-        Ok(mesh) => Ok(MeshHandle { mesh }),
-        Err(e) => Err(JsError::new(&e.to_string())),
-    }
-}
-
 /// A chunk-fed STL parser: construct with the file's size, `push` each chunk
 /// of `file.stream()`, then `finish`.
 ///

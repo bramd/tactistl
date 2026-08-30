@@ -307,7 +307,7 @@ file down to 0.72x plus one chunk.
 
 An ASCII STL gets none of that. It cannot be parsed incrementally without
 reimplementing `stl_io`'s text reader, so `StreamParser` accumulates the whole
-input and hands it to `parse_stl` at the end; its peak is exactly what it was
+input and hands it to the core `parse_stl` at the end; its peak is exactly what it was
 before. This is a deliberate trade: the same geometry costs roughly 5x more
 bytes as text, so nobody ships large ASCII STLs, and every file that has
 actually caused an out-of-memory is binary. If that ever stops being true, the
@@ -323,6 +323,17 @@ ways a multi-gigabyte file reaches the ASCII fallback. The binary ceiling is
 separate and much higher: about 2.61 GB, set by the mesh rather than the file.
 Both refusals say a sentence; before them, the allocation aborted the WASM
 module outright, which a user who cannot see the page experiences as silence.
+
+**An allocation under budget can still abort the module, and that is
+unfixable here.** Every input the app can reach now goes through `StlStream`,
+so a file too large for the budget is refused in Rust with a sentence rather
+than being copied into linear memory first — the whole-buffer WASM entry point
+that made that copy before any check could run has been removed. What remains
+is environmental: a browser that caps WASM memory growth below the wasm32
+4 GiB ceiling, or fragmentation that leaves no contiguous run for a grow the
+budget considers fine, can still fail an allocation that passed every check.
+On wasm32 that failure is an abort, not a catchable error — the module dies and
+the page goes silent. The budgets narrow the window; they do not close it.
 
 **Reloading a model briefly holds two meshes.** The worker parses into a
 temporary and only frees the old handle once the new one exists, so a failed
