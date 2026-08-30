@@ -46,6 +46,41 @@ const DEFAULT_BRAILLE_CELLS = 20;
  */
 const DEFAULT_WRITE_TIMEOUT_MS = 5000;
 
+/**
+ * The packet strategy the SDK will use for a given device name.
+ *
+ * `ALL_PARTIAL` writes several regions of the display in one packet;
+ * `SINGLE_LINE` writes one line per packet.
+ */
+export type ExpectedBufferMode = "ALL_PARTIAL" | "SINGLE_LINE";
+
+/**
+ * The model names 3.0.2's `BufferMode.fromDeviceName` treats as multi-region.
+ *
+ * THIS MIRRORS INTERNAL SDK LOGIC. `BufferMode` is not exported and the chosen
+ * mode is not readable from outside, so the only way to tell the user which
+ * strategy their unit gets is to re-run the SDK's own rule on the name the
+ * device reported. If the vendored SDK is ever updated, this list and the
+ * matching rule below must be re-checked against it -- `version-pin.test.ts`
+ * is the tripwire that will fail and force that check.
+ *
+ * The rule as of 3.0.2: case-insensitive SUBSTRING match, not equality --
+ * `fromDeviceName` lowercases both the reported name and each model string and
+ * asks whether the name contains it.
+ */
+const MULTI_REGION_MODELS = ["DotPad320C", "DotPad320X", "DotPad300A"];
+
+/**
+ * Re-run the SDK's own name rule. See `MULTI_REGION_MODELS` -- this is a
+ * mirror of SDK internals, not a reading of SDK state.
+ */
+export function expectedBufferModeForName(name: string): ExpectedBufferMode {
+  const lowered = name.toLowerCase();
+  return MULTI_REGION_MODELS.some((model) => lowered.includes(model.toLowerCase()))
+    ? "ALL_PARTIAL"
+    : "SINGLE_LINE";
+}
+
 /** The slice of the SDK this sink uses; injectable so tests can pass a fake. */
 export interface DotPadSdkLike {
   connectBleDevice(device: unknown): Promise<DotDevice | null | undefined>;
@@ -145,6 +180,52 @@ export class DotPadSink implements TactileSink {
    */
   private lastSentHex: string | null = null;
 
+  /**
+   * The cell hex of the last TEXT line the device took, or null when unknown.
+   *
+   * Same class of problem as `lastSentHex`, and deliberately the same shape:
+   * `displayTextData` also sends unconditionally, and lands the device in a
+   * 1500 ms text refresh cadence that a redundant write restarts under the
+   * reader's fingers.
+   *
+   * The asymmetry is worth stating: the position label changes on most
+   * scrubber ticks, so unlike the frame check this one rarely fires. It earns
+   * its place in the case where it does -- holding against a clamped scrubber
+   * end, or re-entering a position already shown -- and in reading as one
+   * pattern with the frame suppression rather than two different rules.
+   *
+   * Kept separate from `lastSentHex`: the two go to different display modes on
+   * different parts of the device, so a frame must never mask a text write.
+   */
+  private lastSentTextHex: string | null = null;
+
+  /**
+   * The device's own reported model name, or null while unknown.
+   *
+   * Not cosmetic: it is the ONLY way to tell which packet strategy the SDK
+   * picked, because `BufferMode.fromDeviceName` keys on this string and
+   * exposes neither the choice nor an override. See `expectedBufferMode`.
+   */
+  private reportedDeviceName: string | null = null;
+
+  /**
+   * Names seen through the message callback, keyed by the device they
+   * described.
+   *
+   * This indirection is load-bearing. In 3.0.2 both `connectBleDevice` and
+   * `connectUsbDevice` request the name themselves and the connection
+   * handshake is gated behind the reply -- `#ce` handles the name and only
+   * then emits `Connected`, which is what resolves the connect promise. So the
+   * name arrives BEFORE `connect()` returns, at a moment when `this.device` is
+   * still null and the sink's usual "is this my device?" filter would discard
+   * it. Parking it against the device object instead lets `connect()` claim it
+   * the instant it knows which device is ours.
+   *
+   * Weak so a device that is never adopted -- a failed connect, another
+   * consumer of the same SDK instance -- does not pin its name forever.
+   */
+  private readonly seenDeviceNames = new WeakMap<object, string>();
+
   private readonly queue: LatestWinsQueue<Bitmap>;
 
   constructor(options: DotPadSinkOptions = {}) {
@@ -162,7 +243,18 @@ export class DotPadSink implements TactileSink {
     );
 
     this.sdk.setCallBack(
-      (device, dataCode) => {
+      (device, dataCode, msg) => {
+        if (dataCode === DataCodes.DeviceName) {
+          // Deliberately NOT filtered on `this.device`: this message normally
+          // arrives mid-connect, before the sink has a device to compare
+          // against. Park it and let `connect()` pick it up; also accept it
+          // live, for a device that reports its name later or again.
+          if (msg) {
+            this.seenDeviceNames.set(device as object, msg);
+            if (device === this.device) this.reportedDeviceName = msg;
+          }
+          return;
+        }
         if (dataCode !== DataCodes.Disconnected) return;
         // Some other device on the same SDK instance is not our concern.
         if (device !== this.device) return;
@@ -172,6 +264,8 @@ export class DotPadSink implements TactileSink {
         // What the pins hold after a drop is unknowable, so the next frame
         // must go out even if the app's state has not moved since.
         this.lastSentHex = null;
+        this.lastSentTextHex = null;
+        this.reportedDeviceName = null;
         for (const listener of [...this.disconnectListeners]) listener();
       },
       (_device, keyCode) => {
@@ -199,6 +293,26 @@ export class DotPadSink implements TactileSink {
 
   get connected(): boolean {
     return this.device !== null;
+  }
+
+  /**
+   * The model name the connected device reported, or null when no device is
+   * connected or it has not said.
+   */
+  get deviceName(): string | null {
+    return this.reportedDeviceName;
+  }
+
+  /**
+   * The packet strategy the SDK will have chosen for `deviceName`, or null
+   * while the name is unknown.
+   *
+   * DERIVED, not read: see `expectedBufferModeForName`. The SDK keeps its
+   * choice private, so this replicates the rule rather than reporting it.
+   */
+  get expectedBufferMode(): ExpectedBufferMode | null {
+    const name = this.reportedDeviceName;
+    return name === null ? null : expectedBufferModeForName(name);
   }
 
   /** True while the most recent write failed; cleared by the next success. */
@@ -250,6 +364,14 @@ export class DotPadSink implements TactileSink {
     // that would leave a connected device showing nothing until the user
     // happened to move a control.
     this.lastSentHex = null;
+    this.lastSentTextHex = null;
+    // The SDK asked for the name as part of its own handshake, so by the time
+    // a device is returned the answer has already come through the message
+    // callback and been parked. We do NOT ask again: `requestDeviceInfo` would
+    // re-enter the SDK's name handler, which rebuilds the line configuration
+    // and can clear its per-line diff state -- racing the first frame the app
+    // pushes immediately after connecting, for a string we already have.
+    this.reportedDeviceName = this.seenDeviceNames.get(device as object) ?? null;
   }
 
   async disconnect(): Promise<void> {
@@ -257,6 +379,8 @@ export class DotPadSink implements TactileSink {
     if (!device) return;
     this.device = null;
     this.lastSentHex = null;
+    this.lastSentTextHex = null;
+    this.reportedDeviceName = null;
     this.sdk.disconnect(device);
   }
 
@@ -326,12 +450,21 @@ export class DotPadSink implements TactileSink {
     if (!device) return;
     const cells = device.numberBrailleCellColumns || DEFAULT_BRAILLE_CELLS;
     const hex = await this.textRenderer.toCellHex(text, cells);
+    // Compare on the rendered hex, after the renderer has run and before the
+    // device is touched -- the same place, and for the same reason, as the
+    // frame check: it is the exact payload, so two labels that braille to the
+    // same cells count as the same write. A skip touches the failure latch in
+    // neither direction, because nothing was written.
+    if (hex === this.lastSentTextHex) return;
     await this.withTimeout(
       // `needsTranslation` is explicitly `false`: we ship our own braille table
       // rather than the SDK's liblouis, which is 13.7 MB and LGPL.
       this.sdk.displayTextData(hex, device, DisplayMode.TextMode, false),
       "text",
     );
+    // Recorded only on success, so a throw or a timeout leaves the line
+    // eligible to be retried by the next identical label.
+    this.lastSentTextHex = hex;
     this.clearFailure();
   }
 

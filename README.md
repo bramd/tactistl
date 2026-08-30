@@ -146,9 +146,11 @@ comparison is on the packed hex — the exact payload — rather than on the ren
 parameters, so it catches every case where different parameters happen to
 produce the same dots. It is cleared on connect and on disconnect, because what
 the pins hold across a reconnect is unknowable and the first frame of a session
-must always go out. The text line is not deduped: `displayTextData` uses a
-different refresh mode with a 1500 ms cadence, and the position label genuinely
-changes on nearly every step.
+must always go out. The text line is deduped the same way, on the rendered
+braille hex: `displayTextData` restarts a 1500 ms refresh cadence on every
+call. It fires far less often than the frame check, because the position label
+genuinely changes on nearly every scrubber step — it is there for the case
+where it does not, such as holding against a clamped end of the sweep.
 
 ### What the SDK decides for itself
 
@@ -163,6 +165,17 @@ one packet automatically; on the others it writes a line at a time. There is no
 public API to override the choice, and the app does not try to. Note this is a
 *different* lookup from `DeviceCellType.fromDeviceName`, which picks the D2/D3
 cell type from an overlapping but not identical model list.
+
+To check which strategy a given unit gets, connect it: the connection section
+now shows the name the device reported and the resulting strategy, e.g.
+"Device: DotPad320X — sends several display regions per packet". The SDK asks
+for the name during its own connection handshake, so the sink reads it out of
+the message callback rather than requesting it again. The strategy shown is
+**derived** by re-running the SDK's own substring rule (`expectedBufferModeForName`
+in `web/src/lib/dotpad/sink.ts`), because `BufferMode` exposes neither its
+choice nor an override. That mirrors SDK internals, so it must be re-checked if
+the vendored SDK is ever updated — `vendor/version-pin.test.ts` is the tripwire
+that will fail first.
 
 **Flow control is ack-gated inside the SDK.** The send loop gates on
 `dotCommandSendReady` and advances on `ResponseDisplayLineAck` /

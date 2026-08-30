@@ -23,7 +23,19 @@ function fakeDevice(cellColumns = 30, cellRows = 10, brailleCells = 20) {
   };
 }
 
-function fakes(options: { device?: ReturnType<typeof fakeDevice> } = {}) {
+function fakes(
+  options: {
+    device?: ReturnType<typeof fakeDevice>;
+    /**
+     * When set, the fake reports this model name through the message callback
+     * DURING the connect call, before it resolves -- which is what the real
+     * SDK does, because its connect handshake is gated on the name reply. The
+     * sink therefore sees the name while it still has no device of its own,
+     * and a naive "is this my device?" filter would drop it.
+     */
+    deviceName?: string;
+  } = {},
+) {
   const device = options.device ?? fakeDevice();
   const graphicCalls: string[] = [];
   const textCalls: string[] = [];
@@ -31,9 +43,22 @@ function fakes(options: { device?: ReturnType<typeof fakeDevice> } = {}) {
   let messageCallBack: MessageCallback | null = null;
   let keyCallBack: KeyCallback | null = null;
 
+  /** Mirrors the SDK: the name lands before the connect promise settles. */
+  const reportName = () => {
+    if (options.deviceName !== undefined) {
+      messageCallBack?.(device, "DeviceName", options.deviceName);
+    }
+  };
+
   const sdk = {
-    connectUsbDevice: vi.fn(async (_port: unknown) => device),
-    connectBleDevice: vi.fn(async (_dev: unknown) => device),
+    connectUsbDevice: vi.fn(async (_port: unknown) => {
+      reportName();
+      return device;
+    }),
+    connectBleDevice: vi.fn(async (_dev: unknown) => {
+      reportName();
+      return device;
+    }),
     disconnect: vi.fn((_device?: unknown) => {}),
     // Declared `void` by the SDK, but returning a promise here is legal (a
     // value-returning function is assignable to a void-returning type) and is
@@ -64,7 +89,18 @@ function fakes(options: { device?: ReturnType<typeof fakeDevice> } = {}) {
   };
 
   const textRenderer: TextLineRenderer = {
-    toCellHex: vi.fn(async (_text: string, cells: number) => "aa".repeat(cells)),
+    // The hex MUST depend on the text. A fake that rendered every label to the
+    // same bytes would make the duplicate-text tests vacuous: identical output
+    // for different labels would be suppressed, and the suppression test would
+    // pass without the suppression existing.
+    toCellHex: vi.fn(async (text: string, cells: number) => {
+      let hex = "";
+      for (let i = 0; i < cells; i++) {
+        const code = text.length > 0 ? text.charCodeAt(i % text.length) : 0;
+        hex += (code & 0xff).toString(16).padStart(2, "0");
+      }
+      return hex;
+    }),
   };
 
   return {
@@ -89,8 +125,8 @@ function fakes(options: { device?: ReturnType<typeof fakeDevice> } = {}) {
     healGraphicWrites() {
       graphicResult = undefined;
     },
-    fireMessage(dev: unknown, dataCode: string) {
-      messageCallBack?.(dev, dataCode, "");
+    fireMessage(dev: unknown, dataCode: string, msg = "") {
+      messageCallBack?.(dev, dataCode, msg);
     },
     fireKey(dev: unknown, keyCode: string) {
       keyCallBack?.(dev, keyCode, "");
@@ -550,5 +586,207 @@ describe("DotPadSink duplicate frame suppression", () => {
     sink.renderFrame(blankBitmap(60, 40));
     await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
     expect(f.graphicCalls[1]).toBe(f.graphicCalls[0]);
+  });
+});
+
+describe("DotPadSink duplicate text suppression", () => {
+  it("sends a byte-identical text line only once", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+    sink.renderText("z 10.0mm");
+    // Same trick as the frame case: "no second call" cannot be waited for, so
+    // chase the duplicate with a line that IS different and see what landed.
+    sink.renderText("z 12.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(2));
+    expect(f.textCalls[1]).not.toBe(f.textCalls[0]);
+  });
+
+  it("sends a changed label after a suppressed duplicate, and back again", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+    sink.renderText("z 12.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(2));
+    // Only the LAST line is remembered, so returning to an earlier label sends.
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(3));
+    expect(f.textCalls[2]).toBe(f.textCalls[0]);
+  });
+
+  it("does not latch a failure or notify listeners when it skips a duplicate", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    const errors: unknown[] = [];
+    sink.onError((e) => errors.push(e));
+    await sink.connect("usb");
+
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+    sink.renderText("z 10.0mm");
+    sink.renderText("z 12.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(2));
+    expect(errors).toEqual([]);
+    expect(sink.failing).toBe(false);
+  });
+
+  it("retries a line whose write failed rather than treating it as displayed", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    f.sdk.displayTextData.mockRejectedValueOnce(new Error("text write failed"));
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(sink.failing).toBe(true));
+    expect(f.textCalls).toHaveLength(0);
+
+    // A failed write records nothing, so the identical label must go out again.
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+    expect(sink.failing).toBe(false);
+  });
+
+  it("resends the same line after a disconnect and reconnect", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+
+    await sink.disconnect();
+    await sink.connect("usb");
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(2));
+    expect(f.textCalls[1]).toBe(f.textCalls[0]);
+  });
+
+  it("resends the same line after the device drops and is reconnected", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+
+    f.fireMessage(f.device, "Disconnected");
+    await sink.connect("usb");
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(2));
+    expect(f.textCalls[1]).toBe(f.textCalls[0]);
+  });
+
+  it("keeps the frame and text records apart", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+    // A frame write must never make a text write look like a duplicate.
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+  });
+});
+
+describe("DotPadSink device name and packet strategy", () => {
+  it("reports neither before a device is connected", () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const sink = makeSink(fakes({ deviceName: "DotPad320X" }));
+    expect(sink.deviceName).toBeNull();
+    expect(sink.expectedBufferMode).toBeNull();
+  });
+
+  it("captures a name reported before the connect call resolves", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes({ deviceName: "DotPad320X" });
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    // The real SDK gates its handshake on this reply, so it arrives while the
+    // sink still has no device to match it against.
+    expect(sink.deviceName).toBe("DotPad320X");
+  });
+
+  it("captures a name reported after connecting", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    expect(sink.deviceName).toBeNull();
+    f.fireMessage(f.device, "DeviceName", "DotPad300A");
+    expect(sink.deviceName).toBe("DotPad300A");
+  });
+
+  it("ignores a name reported for some other device", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes({ deviceName: "DotPad320X" });
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    f.fireMessage(fakeDevice(), "DeviceName", "DotPad320C");
+    expect(sink.deviceName).toBe("DotPad320X");
+  });
+
+  it("derives multi-region packets for a DotPad320X", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const sink = makeSink(fakes({ deviceName: "DotPad320X" }));
+    await sink.connect("usb");
+    expect(sink.expectedBufferMode).toBe("ALL_PARTIAL");
+  });
+
+  it("derives multi-region packets for a DotPad320C, matching case-insensitively", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    // The SDK lowercases both sides and matches on substring, so a decorated
+    // name still resolves -- which is why this is not an equality check.
+    const sink = makeSink(fakes({ deviceName: "dotpad320c_1234" }));
+    await sink.connect("usb");
+    expect(sink.expectedBufferMode).toBe("ALL_PARTIAL");
+  });
+
+  it("derives one line per packet for a DotPad320A", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    // Easy to get backwards: DotPad300A is on the multi-region list and
+    // DotPad320A is not, despite differing by one character in each half.
+    const sink = makeSink(fakes({ deviceName: "DotPad320A" }));
+    await sink.connect("usb");
+    expect(sink.expectedBufferMode).toBe("SINGLE_LINE");
+  });
+
+  it("derives one line per packet for an unknown name", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const sink = makeSink(fakes({ deviceName: "SomeFutureBrailleThing" }));
+    await sink.connect("usb");
+    expect(sink.expectedBufferMode).toBe("SINGLE_LINE");
+  });
+
+  it("clears both on an explicit disconnect", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const sink = makeSink(fakes({ deviceName: "DotPad320X" }));
+    await sink.connect("usb");
+    await sink.disconnect();
+    expect(sink.deviceName).toBeNull();
+    expect(sink.expectedBufferMode).toBeNull();
+  });
+
+  it("clears both when the device drops", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes({ deviceName: "DotPad320X" });
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    f.fireMessage(f.device, "Disconnected");
+    expect(sink.deviceName).toBeNull();
+    expect(sink.expectedBufferMode).toBeNull();
   });
 });

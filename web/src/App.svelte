@@ -6,7 +6,7 @@
   import AxisScrubber from "./lib/components/AxisScrubber.svelte";
   import ConnectionControls from "./lib/components/ConnectionControls.svelte";
   import { GeometryClient } from "./lib/geometry/client";
-  import { DotPadSink } from "./lib/dotpad/sink";
+  import { DotPadSink, type ExpectedBufferMode } from "./lib/dotpad/sink";
   import { CanvasPreviewSink } from "./lib/tactile/preview";
   import { startPipeline } from "./lib/pipeline";
   import { createViewerStore, type ViewAxisValue } from "./lib/store";
@@ -37,6 +37,18 @@
   let announcement = $state("");
   let transports = $state<Transport[]>([]);
   let active = $state<Transport | null>(null);
+
+  /**
+   * What the connected device calls itself, and the packet strategy the SDK
+   * derives from that name. Mirrored into state because the sink is a plain
+   * class and nothing here would re-render on a change to its properties.
+   *
+   * Both are read straight after `connect()` resolves: in 3.0.2 the SDK asks
+   * for the name as part of its own connection handshake and does not report
+   * `Connected` until the answer is in, so it is already known by then.
+   */
+  let deviceName = $state<string | null>(null);
+  let bufferMode = $state<ExpectedBufferMode | null>(null);
 
   /**
    * Guards against an out-of-order bounds reply.
@@ -173,6 +185,8 @@
       // disconnected. That is the user saying "not now", not a failure.
       if (!sink.connected) return;
       active = transport;
+      deviceName = sink.deviceName;
+      bufferMode = sink.expectedBufferMode;
       // REQUIRED, not bookkeeping: the pipeline reads the sink's grid on every
       // submission but only wakes on a store change, so this is what makes it
       // re-render at the device's own cell counts instead of leaving the
@@ -194,6 +208,8 @@
       fail(e);
     }
     active = null;
+    deviceName = null;
+    bufferMode = null;
     viewer.setConnected(false);
     announce("Disconnected from the Dot Pad.");
   }
@@ -215,6 +231,8 @@
     const offKey = sink.onKey(viewer.handleDeviceKey);
     const offDisconnect = sink.onDisconnect(() => {
       active = null;
+      deviceName = null;
+      bufferMode = null;
       viewer.setConnected(false);
       announce("The Dot Pad disconnected.");
     });
@@ -307,6 +325,8 @@
     {transports}
     connected={$viewer.connected}
     {active}
+    {deviceName}
+    {bufferMode}
     onconnect={(t) => void connect(t)}
     ondisconnect={() => void disconnect()}
   />

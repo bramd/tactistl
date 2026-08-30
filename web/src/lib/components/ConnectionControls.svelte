@@ -21,16 +21,44 @@
     connected: boolean;
     /** Which transport the live connection uses; null when disconnected. */
     active: Transport | null;
+    /** The model name the device reported; null until it has said. */
+    deviceName: string | null;
+    /**
+     * How the SDK will packetise writes for that model. The union is spelled
+     * out here rather than imported so this component stays free of
+     * `dotpad/` -- only the composition root knows a Dot Pad exists.
+     */
+    bufferMode: "ALL_PARTIAL" | "SINGLE_LINE" | null;
     onconnect: (transport: Transport) => void;
     ondisconnect: () => void;
   }
 
-  let { transports, connected, active, onconnect, ondisconnect }: Props =
-    $props();
+  let {
+    transports,
+    connected,
+    active,
+    deviceName,
+    bufferMode,
+    onconnect,
+    ondisconnect,
+  }: Props = $props();
 
   const NAMES: Record<Transport, string> = {
     usb: "USB",
     ble: "Bluetooth",
+  };
+
+  /**
+   * The packet strategy, in words.
+   *
+   * Worth showing because the SDK picks it from the device NAME alone, with no
+   * override and no way to read the choice back, so this line is the only
+   * answer to "which does my unit get?". The phrasing names the mechanism
+   * without assuming the reader knows the protocol.
+   */
+  const BUFFER_MODES: Record<"ALL_PARTIAL" | "SINGLE_LINE", string> = {
+    ALL_PARTIAL: "several display regions per packet",
+    SINGLE_LINE: "one line of the display per packet",
   };
 
   /**
@@ -81,6 +109,20 @@
 
   {#if connected}
     <p>Connected to a Dot Pad over {active ? NAMES[active] : "an unknown link"}.</p>
+    <!--
+      Diagnostic, deliberately NOT announced: connecting already fires the live
+      region, and a second announcement on the same action would be noise. This
+      is plain static text, here to be read on demand.
+    -->
+    {#if deviceName}
+      <p>
+        Device: {deviceName}{bufferMode
+          ? ` — sends ${BUFFER_MODES[bufferMode]}`
+          : ""}.
+      </p>
+    {:else}
+      <p>Device: this one did not report a model name.</p>
+    {/if}
     <button type="button" bind:this={disconnectButton} onclick={ondisconnect}>
       Disconnect from the Dot Pad over {active ? NAMES[active] : "this link"}
     </button>

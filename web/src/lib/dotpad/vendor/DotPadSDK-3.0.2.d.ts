@@ -13,8 +13,21 @@ export declare const DataCodes: {
   readonly ConnectedFail: "ConnectedFail";
   readonly Disconnected: "Disconnected";
   readonly BoardInfo: "BoardInfo";
+  /**
+   * The device's model name, e.g. `DotPad320X`. Delivered through the message
+   * callback's third argument, from `RSP_DEV_NAME`.
+   */
+  readonly DeviceName: "DeviceName";
 };
 export type DataCodeValue = string;
+
+/** Selects which datum `requestDeviceInfo` asks the device for. */
+export declare const DeviceInfo: {
+  readonly DeviceName: "DeviceName";
+  readonly FirmwareVersion: "FirmwareVersion";
+  readonly HardwareVersion: "HardwareVersion";
+};
+export type DeviceInfoValue = "DeviceName" | "FirmwareVersion" | "HardwareVersion";
 
 export declare const KeyCodes: {
   readonly KeyFunction1: "KeyFunction1";
@@ -44,6 +57,14 @@ export declare class DotPadSDK {
   connectBleDevice(device: unknown): Promise<DotDevice | null | undefined>;
   connectUsbDevice(port: unknown): Promise<DotDevice | null | undefined>;
   disconnect(device?: DotDevice | null): void;
+  /**
+   * Ask the device for one piece of information. Fire-and-forget: the SDK's
+   * wrapper calls the device's own async method WITHOUT returning its promise,
+   * so there is nothing to await and no error to catch here. The answer, if
+   * one comes, arrives through the message callback as the matching
+   * `DataCodes` entry with the value in `msg`.
+   */
+  requestDeviceInfo(device: DotDevice, deviceInfo: DeviceInfoValue): void;
   displayGraphicData(
     hexData: string,
     device?: DotDevice | null,
