@@ -76,6 +76,20 @@ export class CanvasPreviewSink implements TactileSink {
     this.lastText = text;
   }
 
+  /**
+   * Blank the preview, so what a sighted collaborator sees still agrees with
+   * what the device is holding once the device has been blanked too.
+   *
+   * The retained text goes with it: on hardware the same call lowers the
+   * braille line as well, so keeping the last label here would show a line the
+   * device no longer has.
+   */
+  clear(): void {
+    this.lastBitmap = null;
+    this.lastText = "";
+    this.paint();
+  }
+
   get text(): string {
     return this.lastText;
   }

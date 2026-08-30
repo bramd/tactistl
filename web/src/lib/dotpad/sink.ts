@@ -98,6 +98,7 @@ export interface DotPadSdkLike {
     /** Narrowed to `false`: `true` would dynamically import liblouis, which we do not ship. */
     needsTranslation?: false,
   ): Promise<void>;
+  displayAllDown(device?: DotDevice | null): void;
   setCallBack(
     messageCallBack:
       | ((device: DotDevice, dataCode: DataCodeValue, msg: string) => void)
@@ -200,6 +201,25 @@ export class DotPadSink implements TactileSink {
   private lastSentTextHex: string | null = null;
 
   /**
+   * Bumped every time what the device is showing stops being a consequence of
+   * the last write this sink recorded.
+   *
+   * A write records `lastSentHex` only AFTER it has settled, so there is a real
+   * window in which the display's state changes underneath a write that is
+   * still in flight -- `clear()` blanking the pins between the SDK call and its
+   * completion is exactly that, and a drop is the same shape. Without this, the
+   * late completion writes the pre-clear hex back into the cache it just
+   * invalidated, and the next identical frame is suppressed: a connected
+   * display left blank, which is precisely the symptom `clear()` exists to
+   * prevent.
+   *
+   * So a write compares the epoch it started under with the one in force when
+   * it finishes, and declines to record itself if the world moved. Only the
+   * CACHE is skipped -- the write did settle, so the failure latch still clears.
+   */
+  private displayEpoch = 0;
+
+  /**
    * The device's own reported model name, or null while unknown.
    *
    * Not cosmetic: it is the ONLY way to tell which packet strategy the SDK
@@ -263,8 +283,7 @@ export class DotPadSink implements TactileSink {
         this.device = null;
         // What the pins hold after a drop is unknowable, so the next frame
         // must go out even if the app's state has not moved since.
-        this.lastSentHex = null;
-        this.lastSentTextHex = null;
+        this.forgetDisplayedState();
         this.reportedDeviceName = null;
         for (const listener of [...this.disconnectListeners]) listener();
       },
@@ -363,8 +382,7 @@ export class DotPadSink implements TactileSink {
     // duplicate check must not suppress the first frame after connecting --
     // that would leave a connected device showing nothing until the user
     // happened to move a control.
-    this.lastSentHex = null;
-    this.lastSentTextHex = null;
+    this.forgetDisplayedState();
     // The SDK asked for the name as part of its own handshake, so by the time
     // a device is returned the answer has already come through the message
     // callback and been parked. We do NOT ask again: `requestDeviceInfo` would
@@ -378,8 +396,7 @@ export class DotPadSink implements TactileSink {
     const device = this.device;
     if (!device) return;
     this.device = null;
-    this.lastSentHex = null;
-    this.lastSentTextHex = null;
+    this.forgetDisplayedState();
     this.reportedDeviceName = null;
     this.sdk.disconnect(device);
   }
@@ -396,6 +413,46 @@ export class DotPadSink implements TactileSink {
     // surface as an unhandled rejection, so it goes through the same latch as
     // frame writes.
     void this.writeText(text).catch((e: unknown) => this.recordFailure(e));
+  }
+
+  /**
+   * Lower every pin, on both the graphic area and the text line.
+   *
+   * `displayAllDown` is the SDK's own blanking call: in 3.0.2 it writes
+   * `"00"`-repeated hex to the device's text data AND its graphic data, so one
+   * call covers both regions.
+   *
+   * Deliberately NOT routed through the frame queue. The queue exists to
+   * coalesce a burst of frames into the newest one, and a clear is not a frame
+   * -- it is a statement about the device that must not be dropped in favour of
+   * a later bitmap. The only caller clears when no model is loaded, i.e. when
+   * no frame is in flight or about to be, so there is nothing to race.
+   */
+  clear(): void {
+    const device = this.device;
+    if (!device) return;
+    // Reset BEFORE the write, and unconditionally. The pins are about to move
+    // (or have moved) to a state this process did not send, so the record of
+    // "what the device is showing" is stale either way -- and null is the safe
+    // direction, because it costs at worst one redundant write while leaving
+    // it set would silently suppress the next real frame or label and strand
+    // the display blank. That would be indistinguishable, to the reader, from
+    // a connection that had failed.
+    // Bumping the epoch alongside the nulls is what makes this hold against a
+    // write that is still in flight: that write's late completion would
+    // otherwise record the pre-clear frame into the cache this just cleared.
+    this.forgetDisplayedState();
+    try {
+      this.sdk.displayAllDown(device);
+    } catch (e) {
+      // The pipeline calls this from a microtask with nothing catching around
+      // it, so unlike every other write here -- which lands in the queue or in
+      // `renderText`'s catch -- a synchronous throw would escape as an
+      // unhandled error. Route it through the same latch instead.
+      this.recordFailure(e);
+      return;
+    }
+    this.clearFailure();
   }
 
   onKey(listener: KeyListener): () => void {
@@ -415,7 +472,18 @@ export class DotPadSink implements TactileSink {
     return unsubscribable(this.errorListeners, listener);
   }
 
+  /**
+   * Forget what the device is showing. The one place that invalidates the
+   * caches, so the epoch can never be bumped without them or they without it.
+   */
+  private forgetDisplayedState(): void {
+    this.lastSentHex = null;
+    this.lastSentTextHex = null;
+    this.displayEpoch++;
+  }
+
   private async writeFrame(bitmap: Bitmap): Promise<void> {
+    const epoch = this.displayEpoch;
     const device = this.device;
     // The device can vanish between submission and dequeue.
     if (!device) return;
@@ -441,11 +509,12 @@ export class DotPadSink implements TactileSink {
     // Only a write that settled counts. A throw or a timeout leaves the record
     // untouched, so the user re-scrubbing back to the same slice retries it
     // instead of being told, silently, that it is already displayed.
-    this.lastSentHex = hex;
+    if (epoch === this.displayEpoch) this.lastSentHex = hex;
     this.clearFailure();
   }
 
   private async writeText(text: string): Promise<void> {
+    const epoch = this.displayEpoch;
     const device = this.device;
     if (!device) return;
     const cells = device.numberBrailleCellColumns || DEFAULT_BRAILLE_CELLS;
@@ -464,7 +533,7 @@ export class DotPadSink implements TactileSink {
     );
     // Recorded only on success, so a throw or a timeout leaves the line
     // eligible to be retried by the next identical label.
-    this.lastSentTextHex = hex;
+    if (epoch === this.displayEpoch) this.lastSentTextHex = hex;
     this.clearFailure();
   }
 

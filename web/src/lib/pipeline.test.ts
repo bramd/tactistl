@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Bounds, RenderRequest } from "./geometry/client";
-import { startPipeline } from "./pipeline";
+import { NO_MODEL_MESSAGE, startPipeline } from "./pipeline";
+import { SimpleBrailleRenderer } from "./dotpad/braille";
+import { CanvasPreviewSink } from "./tactile/preview";
 import { ViewAxis, createViewerStore } from "./store";
 import type { Bitmap, TactileSink, Transport } from "./tactile/types";
 
@@ -61,6 +63,8 @@ function fakeGeometry() {
 class FakeSink implements TactileSink {
   readonly frames: Bitmap[] = [];
   readonly texts: string[] = [];
+  /** How many times the pipeline asked for the display to be blanked. */
+  clears = 0;
   grid: { width: number; height: number };
 
   constructor(width = 60, height = 40) {
@@ -75,6 +79,9 @@ class FakeSink implements TactileSink {
   }
   renderText(text: string): void {
     this.texts.push(text);
+  }
+  clear(): void {
+    this.clears++;
   }
   async connect(_transport: Transport): Promise<void> {}
   async disconnect(): Promise<void> {}
@@ -385,5 +392,214 @@ describe("startPipeline", () => {
 
     expect(g.requests).toHaveLength(renders);
     expect(sink.texts).toHaveLength(texts);
+  });
+});
+
+describe("connecting with no model loaded", () => {
+  it("blanks the sinks and says so on the text line", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    const sink = new FakeSink();
+    const stop = startPipeline(store, g.client, [sink]);
+
+    store.setConnected(true);
+    await flush();
+
+    // A tactile display holds its dots mechanically, so before this it kept
+    // whatever was physically on it -- a previous session's frame, or another
+    // app's output -- with nothing to say so.
+    expect(sink.clears).toBe(1);
+    // And blanking alone is not enough: lowered pins are exactly what a
+    // connection that silently failed feels like, so the line is the positive
+    // confirmation that the link is open and there is nothing loaded.
+    expect(sink.texts).toEqual([NO_MODEL_MESSAGE]);
+    expect(g.requests).toHaveLength(0);
+    stop();
+  });
+
+  it("blanks every sink, not just the device", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    const a = new FakeSink();
+    const b = new FakeSink();
+    const stop = startPipeline(store, g.client, [a, b]);
+
+    store.setConnected(true);
+    await flush();
+
+    // The on-screen preview has to agree with the device, or a sighted
+    // collaborator is looking at a frame the reader's fingers cannot find.
+    expect(a.clears).toBe(1);
+    expect(b.clears).toBe(1);
+    stop();
+  });
+
+  it("does not blank anything when the device drops", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    const sink = new FakeSink();
+    const stop = startPipeline(store, g.client, [sink]);
+
+    store.setConnected(true);
+    await flush();
+    store.setConnected(false);
+    await flush();
+
+    // The disconnect transition runs the same block. There is no device left
+    // to write to, and clearing on the way out would be a write into nowhere.
+    expect(sink.clears).toBe(1);
+    stop();
+  });
+
+  it("shows the real label once a model arrives, and blanks nothing more", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    const sink = new FakeSink();
+    const stop = startPipeline(store, g.client, [sink]);
+
+    store.setConnected(true);
+    await flush();
+    store.onModelLoaded(12, B);
+    await flush();
+    g.release();
+    await flush();
+
+    // The message must not become a duplicate-suppressing cache entry that
+    // eats the first real position line.
+    expect(sink.texts).toEqual([NO_MODEL_MESSAGE, "20.0 of 40.0 mm"]);
+    expect(sink.clears).toBe(1);
+    expect(sink.frames).toHaveLength(1);
+    stop();
+  });
+
+  it("says it again on a reconnect that is still empty", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    const sink = new FakeSink();
+    const stop = startPipeline(store, g.client, [sink]);
+
+    store.setConnected(true);
+    await flush();
+    store.setConnected(false);
+    await flush();
+    store.setConnected(true);
+    await flush();
+
+    // The second device has its own pins, holding their own stale state.
+    expect(sink.clears).toBe(2);
+    expect(sink.texts).toEqual([NO_MODEL_MESSAGE, NO_MODEL_MESSAGE]);
+    stop();
+  });
+});
+
+describe("connecting with a model loaded", () => {
+  it("does not blank, and still forces the frame and the label", async () => {
+    const store = createViewerStore();
+    const g = fakeGeometry();
+    // 60x40, byte-identical to the disconnected fallback, so only the connect
+    // transition itself can force this frame -- the case the clear must not
+    // disturb.
+    const sink = new FakeSink(60, 40);
+    const stop = startPipeline(store, g.client, [sink]);
+
+    store.onModelLoaded(12, B);
+    await flush();
+    g.release();
+    await flush();
+
+    store.setConnected(true);
+    await flush();
+    g.release();
+    await flush();
+
+    // Blanking here would flash, and would restart the SDK's multi-second pin
+    // re-actuation cycle for a frame that is about to land anyway.
+    expect(sink.clears).toBe(0);
+    expect(g.requests).toHaveLength(2);
+    expect(sink.frames).toHaveLength(2);
+    expect(sink.texts).toEqual(["20.0 of 40.0 mm", "20.0 of 40.0 mm"]);
+    stop();
+  });
+});
+
+describe("NO_MODEL_MESSAGE", () => {
+  it("fits the A320's 20-cell braille line with room to spare", async () => {
+    // Measured through the renderer the device actually gets, not counted by
+    // hand: the renderer spends extra cells on number and capital indicators,
+    // so character count is not cell count in general.
+    const hex = await new SimpleBrailleRenderer().toCellHex(NO_MODEL_MESSAGE, 20);
+    const cells = hex.match(/../g) ?? [];
+    expect(cells).toHaveLength(20);
+
+    // Trailing blanks are padding; what matters is that the message ends
+    // before the line does, so nothing is truncated mid-word.
+    const used = cells.length - [...cells].reverse().findIndex((c) => c !== "00");
+    expect(used).toBe(15);
+    expect(used).toBeLessThan(20);
+
+    // Everything the renderer cannot render becomes a blank cell, so a stray
+    // character would silently punch a hole in the middle of the message.
+    const interior = cells.slice(0, used);
+    const blanks = interior.filter((c) => c === "00").length;
+    expect(blanks).toBe(NO_MODEL_MESSAGE.split(" ").length - 1);
+  });
+});
+
+/**
+ * The preview draws into a 2d context, and the test environment has no DOM, so
+ * this stands in for both. Only the calls `paint` makes are recorded: what
+ * matters is which dots came out bright.
+ */
+function fakeCanvas() {
+  const fills: string[] = [];
+  const ctx = {
+    fillStyle: "",
+    fillRect: () => {},
+    beginPath: () => {},
+    arc: () => {},
+    fill() {
+      fills.push(ctx.fillStyle);
+    },
+  };
+  const canvas = {
+    width: 0,
+    height: 0,
+    getContext: () => ctx,
+  };
+  return {
+    fills,
+    /** How many dots the last paint drew raised. */
+    raised: () => fills.filter((c) => c === "#f2f2f7").length,
+    /** Discard everything painted so far, so the next paint stands alone. */
+    reset: () => fills.splice(0, fills.length),
+    element: canvas as unknown as HTMLCanvasElement,
+  };
+}
+
+/**
+ * Lives here rather than beside the preview because this is where the sinks
+ * are exercised as a group; the behaviour under test is the one the pipeline
+ * relies on when it blanks every sink at once.
+ */
+describe("CanvasPreviewSink.clear", () => {
+  it("blanks the preview so it agrees with the blanked device", () => {
+    const canvas = fakeCanvas();
+    const preview = new CanvasPreviewSink(canvas.element, { width: 4, height: 4 });
+
+    const bitmap: Bitmap = { width: 4, height: 4, data: new Uint8Array(16).fill(1) };
+    preview.renderFrame(bitmap);
+    preview.renderText("20.0 of 40.0 mm");
+    canvas.reset();
+    preview.renderFrame(bitmap);
+    expect(canvas.raised()).toBe(16);
+
+    canvas.reset();
+    preview.clear();
+
+    expect(canvas.raised()).toBe(0);
+    // The device's braille line goes down with its graphic area -- the SDK's
+    // blanking call writes zeros to both -- so a retained label here would
+    // show a line the device no longer has.
+    expect(preview.text).toBe("");
   });
 });

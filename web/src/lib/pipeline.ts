@@ -26,6 +26,23 @@ export interface GeometryLike {
 const FALLBACK_GRID = { width: 60, height: 40 } as const;
 
 /**
+ * What the braille line says when a device is attached with nothing to show.
+ *
+ * Blanking the display alone is not enough, and this is the part that matters
+ * for a blind reader: a plate of lowered pins is exactly what a connection that
+ * silently failed also feels like. A short line of text is positive evidence --
+ * the link is open, the app is driving it, and there is genuinely nothing
+ * loaded.
+ *
+ * Constrained by the hardware: the A320's text line is 20 cells and our braille
+ * is uncontracted, so this is a per-character budget. Fifteen lowercase letters
+ * and spaces render as fifteen cells with no indicator cells (no digits, no
+ * capitals), leaving five spare -- see `pipeline.test.ts`, which measures it
+ * through the real renderer rather than trusting the arithmetic here.
+ */
+export const NO_MODEL_MESSAGE = "no model loaded";
+
+/**
  * Identifies a render. Two states with the same key produce byte-identical
  * output, so the second is not worth a slice.
  *
@@ -142,8 +159,27 @@ export function startPipeline(
       lastConnected = s.connected;
       lastKey = null;
       lastLabel = null;
+      // Connecting with nothing loaded used to do nothing at all, which left
+      // the device holding whatever was physically on it -- a previous
+      // session's frame, or another app's. Blank it and say so.
+      //
+      // Gated on `s.connected` because this block also fires on a DROP, where
+      // there is no device left to write to; and on the no-model condition
+      // because with a model loaded the frame below is about to land. Writing
+      // a clear first would both flash and restart the SDK's multi-second pin
+      // re-actuation cycle for nothing.
+      //
+      // `sendLabel`, not a direct write: it is the one place that owns
+      // `lastLabel`, so the real axis label still goes out when a model
+      // arrives (it differs from this), and a later reconnect re-sends this
+      // one (the transition just nulled the cache).
+      if (s.connected && (!s.modelLoaded || !s.bounds)) {
+        for (const sink of sinks) sink.clear();
+        sendLabel(NO_MODEL_MESSAGE);
+      }
     }
 
+    // Same condition as the clear above, deliberately: the two must not drift.
     if (!s.modelLoaded || !s.bounds) return;
 
     // Pushed rather than left to the label subscription: that store is derived,

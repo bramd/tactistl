@@ -39,7 +39,11 @@ function fakes(
   const device = options.device ?? fakeDevice();
   const graphicCalls: string[] = [];
   const textCalls: string[] = [];
+  /** The device each `displayAllDown` was aimed at, one entry per call. */
+  const downCalls: unknown[] = [];
+  let allDownThrows: string | null = null;
   let graphicResult: Promise<void> | undefined;
+  let releaseGraphic: (() => void) | null = null;
   let messageCallBack: MessageCallback | null = null;
   let keyCallBack: KeyCallback | null = null;
 
@@ -77,6 +81,10 @@ function fakes(
         textCalls.push(hex);
       },
     ),
+    displayAllDown: vi.fn((device?: unknown) => {
+      if (allDownThrows !== null) throw new Error(allDownThrows);
+      downCalls.push(device);
+    }),
     setCallBack: vi.fn((m: MessageCallback | null, k: KeyCallback | null) => {
       messageCallBack = m;
       keyCallBack = k;
@@ -110,6 +118,28 @@ function fakes(
     textRenderer,
     graphicCalls,
     textCalls,
+    downCalls,
+    /** Make the blanking call throw, to exercise the failure latch. */
+    failAllDown(message = "clear failed") {
+      allDownThrows = message;
+    },
+    /**
+     * Hold graphic writes open until `releaseGraphicWrites` is called, so a
+     * test can put something between the SDK call and its completion without
+     * racing a timer.
+     */
+    holdGraphicWrites() {
+      graphicResult = new Promise<void>((resolve) => {
+        releaseGraphic = resolve;
+      });
+    },
+    /** Let a held graphic write finish. */
+    releaseGraphicWrites() {
+      const release = releaseGraphic;
+      releaseGraphic = null;
+      graphicResult = undefined;
+      release?.();
+    },
     /** Make the next graphic write hang forever, to exercise the timeout. */
     hangGraphicWrites() {
       graphicResult = new Promise<void>(() => {});
@@ -154,6 +184,16 @@ function dottedBitmap(width: number, height: number): Bitmap {
   bitmap.data[0] = 1;
   return bitmap;
 }
+
+/**
+ * Let every already-scheduled continuation run.
+ *
+ * `vi.waitFor` returns as soon as its condition holds, which for a
+ * synchronously-recorded SDK call is BEFORE the write's own continuation has
+ * run and updated the sink's record of what the device is showing. Tests about
+ * that record have to wait for it, not for the call.
+ */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 afterEach(() => {
   // A leaked `navigator` stub silently changes what the next test's feature
@@ -788,5 +828,150 @@ describe("DotPadSink device name and packet strategy", () => {
     f.fireMessage(f.device, "Disconnected");
     expect(sink.deviceName).toBeNull();
     expect(sink.expectedBufferMode).toBeNull();
+  });
+});
+
+describe("DotPadSink clear", () => {
+  it("lowers every pin on the connected device", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.clear();
+
+    expect(f.sdk.displayAllDown).toHaveBeenCalledTimes(1);
+    // Aimed at OUR device, never at the SDK's "every attached device"
+    // overload: another consumer's display is not ours to blank.
+    expect(f.downCalls).toEqual([f.device]);
+  });
+
+  it("does nothing while disconnected", () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+
+    sink.clear();
+
+    expect(f.sdk.displayAllDown).not.toHaveBeenCalled();
+  });
+
+  it("resends a frame identical to the one that was cleared away", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+    // The write must be fully recorded before the clear, or this would pass
+    // for the wrong reason: a cache never written to needs no resetting.
+    await settle();
+
+    sink.clear();
+
+    // THE case this method exists to survive. The pins are down now, so the
+    // frame the sink last sent is no longer what the device is showing --
+    // suppressing it as a duplicate would leave a connected display blank,
+    // which to a blind reader is indistinguishable from a dead link.
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+    expect(f.graphicCalls[1]).toBe(f.graphicCalls[0]);
+  });
+
+  it("resends a text line identical to the one that was cleared away", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(1));
+    await settle();
+
+    sink.clear();
+
+    // Separate cache, same trap: the SDK's `displayAllDown` blanks the braille
+    // line too, so the label the fingers were on is gone from the device.
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(2));
+    expect(f.textCalls[1]).toBe(f.textCalls[0]);
+  });
+
+  it("latches a failed clear rather than throwing into the caller", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    const errors: unknown[] = [];
+    sink.onError((e) => errors.push(e));
+    await sink.connect("usb");
+    f.failAllDown();
+
+    // The pipeline calls this from a microtask with nothing catching around
+    // it, so a synchronous throw would escape as an unhandled error.
+    expect(() => sink.clear()).not.toThrow();
+    expect(sink.failing).toBe(true);
+    expect(errors).toHaveLength(1);
+  });
+
+  it("still forces the next frame out when the clear itself failed", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+    await settle();
+
+    f.failAllDown();
+    sink.clear();
+
+    // A clear that threw may have moved the pins part of the way, or not at
+    // all. Either way what the device holds is now unknown, so the safe
+    // direction is to resend rather than to assume the old frame survived.
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+  });
+  it("does not let a frame still in flight undo the clear", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    // A write records what the device is showing only once it has SETTLED, so
+    // there is a real window in which the pins change under a write that has
+    // not finished. Blanking inside that window is the window's worst case.
+    f.holdGraphicWrites();
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+
+    sink.clear();
+    f.releaseGraphicWrites();
+    await settle();
+
+    // Without the epoch check, that late completion writes the pre-clear frame
+    // back into the cache the clear just emptied, and this frame is suppressed
+    // -- leaving a connected display blank, the exact symptom clear() exists
+    // to prevent.
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+  });
+
+  it("does not let a text line still in flight undo the clear", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    // The text path has no hold hook, but it does not need one: the renderer
+    // is async, so clearing before the awaited render resolves puts the clear
+    // inside the same window.
+    sink.renderText("z 10.0mm");
+    sink.clear();
+    await settle();
+
+    sink.renderText("z 10.0mm");
+    await vi.waitFor(() => expect(f.textCalls).toHaveLength(2));
+    expect(f.textCalls[1]).toBe(f.textCalls[0]);
   });
 });
