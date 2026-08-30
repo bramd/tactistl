@@ -112,6 +112,13 @@ function blankBitmap(width: number, height: number): Bitmap {
   return { width, height, data: new Uint8Array(width * height) };
 }
 
+/** The same, with one dot raised, so it packs to a different cell hex. */
+function dottedBitmap(width: number, height: number): Bitmap {
+  const bitmap = blankBitmap(width, height);
+  bitmap.data[0] = 1;
+  return bitmap;
+}
+
 afterEach(() => {
   // A leaked `navigator` stub silently changes what the next test's feature
   // detection sees, which is a classic source of false greens here.
@@ -311,9 +318,11 @@ describe("DotPadSink failure latching", () => {
     await vi.waitFor(() => expect(sink.failing).toBe(false));
     expect(errors).toHaveLength(1);
 
-    // ...so the next run of failures is announced afresh.
+    // ...so the next run of failures is announced afresh. It has to be a
+    // DIFFERENT bitmap: an identical one is suppressed as a duplicate of the
+    // frame that just succeeded, and never reaches the device to fail.
     f.failGraphicWrites();
-    sink.renderFrame(blankBitmap(60, 40));
+    sink.renderFrame(dottedBitmap(60, 40));
     await vi.waitFor(() => expect(errors).toHaveLength(2));
     expect(sink.failing).toBe(true);
   });
@@ -432,5 +441,114 @@ describe("DotPadSink device callbacks", () => {
     off();
     f.fireKey(f.device, "KeyFunction2");
     expect(keys).toEqual(["KeyFunction1", "PanningRight"]);
+  });
+});
+
+describe("DotPadSink duplicate frame suppression", () => {
+  it("sends a byte-identical frame only once", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+    sink.renderFrame(blankBitmap(60, 40));
+    // Asserting "no second call" by waiting is unfalsifiable, so chase the
+    // duplicate with a frame that IS different and check what actually landed.
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+    expect(f.graphicCalls[1]).not.toBe(f.graphicCalls[0]);
+  });
+
+  it("sends a changed frame after a suppressed duplicate", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+    // And back again: the previous frame is not remembered, only the last one.
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(3));
+    expect(f.graphicCalls[2]).toBe(f.graphicCalls[0]);
+  });
+
+  it("does not latch a failure or notify listeners when it skips a duplicate", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    const errors: unknown[] = [];
+    sink.onError((e) => errors.push(e));
+    await sink.connect("usb");
+
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+    sink.renderFrame(blankBitmap(60, 40));
+    sink.renderFrame(dottedBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+    expect(errors).toEqual([]);
+    expect(sink.failing).toBe(false);
+  });
+
+  it("retries a frame whose write failed rather than treating it as displayed", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+
+    f.failGraphicWrites();
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(sink.failing).toBe(true));
+    expect(f.graphicCalls).toHaveLength(1);
+
+    // A failed write records nothing, so the very same bitmap must go out
+    // again -- otherwise re-scrubbing to a failed slice would be a no-op and
+    // the device would silently hold a stale frame.
+    f.healGraphicWrites();
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(sink.failing).toBe(false));
+    expect(f.graphicCalls).toHaveLength(2);
+    expect(f.graphicCalls[1]).toBe(f.graphicCalls[0]);
+  });
+
+  it("resends the same frame after an explicit disconnect and reconnect", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+
+    await sink.disconnect();
+    await sink.connect("usb");
+    // The pins' physical state across a reconnect is unknown, so the first
+    // frame of a session always goes out.
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+    expect(f.graphicCalls[1]).toBe(f.graphicCalls[0]);
+  });
+
+  it("resends the same frame after the device drops and is reconnected", async () => {
+    vi.stubGlobal("navigator", { serial: {} });
+    const f = fakes();
+    const sink = makeSink(f);
+    await sink.connect("usb");
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(1));
+
+    // The unplug path, which goes through the SDK message callback rather
+    // than through `disconnect()`.
+    f.fireMessage(f.device, "Disconnected");
+    expect(sink.connected).toBe(false);
+    await sink.connect("usb");
+    sink.renderFrame(blankBitmap(60, 40));
+    await vi.waitFor(() => expect(f.graphicCalls).toHaveLength(2));
+    expect(f.graphicCalls[1]).toBe(f.graphicCalls[0]);
   });
 });

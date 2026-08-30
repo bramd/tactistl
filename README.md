@@ -122,6 +122,54 @@ cross-check in a slicer while not being one. Front and Side sweeps also run in
 the opposite direction to the model's own axis, so the letter would be actively
 misleading. A position within the sweep is true under every rotation and view.
 
+### Why the display keeps moving after a write
+
+Watch a Dot Pad take a frame and the pins carry on re-actuating for several
+seconds afterwards. That is not a bug in this app and not a stuck write. The
+SDK's `displayGraphicData` ends by scheduling `graphicRefresh()`, which makes
+up to six deferred re-actuation passes at 500 ms intervals (lines 1-3, then
+lines 4-10) to counter the pins drooping out of position. There is no way to
+turn it off in 3.0.2: the `isAutoRefresh` field is initialised to `false` and
+never read anywhere in the file.
+
+The consequence is that a graphic write is never free, even when it carries no
+new data. `setDotPadLineCommand` *does* diff per line and queues no payload for
+an unchanged one, but `displayGraphicData` sets the refresh mode and sends
+unconditionally, so a call with data identical to what is already displayed
+restarts the whole re-actuation cycle under the reader's fingers.
+
+So `DotPadSink` suppresses a frame whose packed cell hex matches the last frame
+the device took. The scrubber has 100 steps across 40 dot rows, so most ticks
+rasterize to a bitmap byte-identical to the one before, and without the check
+each of those would restart several seconds of pin movement for no change. The
+comparison is on the packed hex — the exact payload — rather than on the render
+parameters, so it catches every case where different parameters happen to
+produce the same dots. It is cleared on connect and on disconnect, because what
+the pins hold across a reconnect is unknowable and the first frame of a session
+must always go out. The text line is not deduped: `displayTextData` uses a
+different refresh mode with a 1500 ms cadence, and the position label genuinely
+changes on nearly every step.
+
+### What the SDK decides for itself
+
+Two things that look like they want app-side handling are already handled
+inside the vendored SDK, and adding our own would be duplication at best.
+
+**Packet strategy is chosen from the device NAME, not by us.**
+`BufferMode.fromDeviceName` returns `ALL_PARTIAL` for a name containing
+`DotPad320C`, `DotPad320X` or `DotPad300A`, and `SINGLE_LINE` for everything
+else. On the `ALL_PARTIAL` models the SDK therefore writes several regions in
+one packet automatically; on the others it writes a line at a time. There is no
+public API to override the choice, and the app does not try to. Note this is a
+*different* lookup from `DeviceCellType.fromDeviceName`, which picks the D2/D3
+cell type from an overlapping but not identical model list.
+
+**Flow control is ack-gated inside the SDK.** The send loop gates on
+`dotCommandSendReady` and advances on `ResponseDisplayLineAck` /
+`notificateDisplayComplete`. The app must not add pacing, chunking or retry
+logic of its own on top of it; doing so would interleave with the SDK's own
+queue rather than replace it.
+
 ## Known limitations
 
 This section is the honest part. Several of these are invisible to the user the

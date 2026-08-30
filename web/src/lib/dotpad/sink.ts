@@ -125,6 +125,26 @@ export class DotPadSink implements TactileSink {
    */
   private latchedFailure = false;
 
+  /**
+   * The cell hex of the last frame the device ACKNOWLEDGED taking, or null when
+   * what it is showing is unknown.
+   *
+   * This exists because a graphic write is never free, even when it carries no
+   * new data. `setDotPadLineCommand` does diff per line and queues nothing for
+   * an unchanged one, but `displayGraphicData` sets the refresh mode and sends
+   * unconditionally, and reaching the end of the line list runs
+   * `graphicRefresh()`: up to six deferred pin re-actuation passes at 500 ms
+   * intervals, to counter droop. That cycle cannot be disabled in 3.0.2. So a
+   * redundant call costs no payload but physically restarts several seconds of
+   * pin movement under the reader's fingers.
+   *
+   * Deduping on the hex rather than on the bitmap or the render parameters is
+   * deliberate: it is the exact payload, so it catches every case where
+   * different parameters happen to rasterize to the same dots -- which, at 100
+   * scrubber steps across 40 dot rows, is most of a scrub.
+   */
+  private lastSentHex: string | null = null;
+
   private readonly queue: LatestWinsQueue<Bitmap>;
 
   constructor(options: DotPadSinkOptions = {}) {
@@ -149,6 +169,9 @@ export class DotPadSink implements TactileSink {
         // Clear the device BEFORE notifying, so a listener that reads
         // `connected` (to update a button label, say) sees the new truth.
         this.device = null;
+        // What the pins hold after a drop is unknowable, so the next frame
+        // must go out even if the app's state has not moved since.
+        this.lastSentHex = null;
         for (const listener of [...this.disconnectListeners]) listener();
       },
       (_device, keyCode) => {
@@ -221,12 +244,19 @@ export class DotPadSink implements TactileSink {
 
     this.device = device;
     this.latchedFailure = false;
+    // A freshly attached device may be blank, or may still hold a previous
+    // session's frame. Either way this process has not written to it, so the
+    // duplicate check must not suppress the first frame after connecting --
+    // that would leave a connected device showing nothing until the user
+    // happened to move a control.
+    this.lastSentHex = null;
   }
 
   async disconnect(): Promise<void> {
     const device = this.device;
     if (!device) return;
     this.device = null;
+    this.lastSentHex = null;
     this.sdk.disconnect(device);
   }
 
@@ -269,6 +299,12 @@ export class DotPadSink implements TactileSink {
     // A size mismatch throws here, inside the queue's send, so it lands in the
     // latch as a failure rather than escaping into an unhandled rejection.
     const hex = bitmapToCellHex(bitmap, cellColumns, cellRows);
+    // Compare here, inside the send, rather than at submission: the queue
+    // coalesces, so this compares against what was actually last written to the
+    // device rather than against a frame that may never have been sent. A skip
+    // deliberately touches the failure latch in neither direction -- nothing
+    // was written, so it is evidence of neither a healthy link nor a broken one.
+    if (hex === this.lastSentHex) return;
     await this.withTimeout(
       // The SDK's `displayGraphicData` is declared (and, in 3.0.2, is) a
       // synchronous void call, so `Promise.resolve` normally settles at once.
@@ -278,6 +314,10 @@ export class DotPadSink implements TactileSink {
       Promise.resolve(this.sdk.displayGraphicData(hex, device, DisplayMode.GraphicMode)),
       "graphic",
     );
+    // Only a write that settled counts. A throw or a timeout leaves the record
+    // untouched, so the user re-scrubbing back to the same slice retries it
+    // instead of being told, silently, that it is already displayed.
+    this.lastSentHex = hex;
     this.clearFailure();
   }
 
