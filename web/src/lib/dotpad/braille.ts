@@ -13,6 +13,8 @@ function dots(...ds: number[]): number {
 
 const NUMBER_SIGN = dots(3, 4, 5, 6);
 const CAPITAL_SIGN = dots(6);
+/** UEB grade 1 indicator, needed before a letter a-j that follows a digit. */
+const GRADE_1_SIGN = dots(5, 6);
 const BLANK = 0;
 
 /** Letters a-j double as digits 1-9 and 0 after a number sign. */
@@ -47,12 +49,24 @@ const LETTERS: Record<string, number> = {
 
 const DIGITS = "jabcdefghi"; // index by the digit's value
 
+/** The letters that share a cell with a digit, so are ambiguous after one. */
+const DIGIT_LETTERS = "abcdefghij";
+
+/**
+ * The decimal point is dots 256 in UEB. Older English Braille American Edition
+ * used dots 46 for it; this table is UEB throughout.
+ *
+ * No entry for "/": the UEB solidus is the two-cell dots 456 then dots 34, and
+ * every other entry here is a single cell, so supporting it would mean teaching
+ * the loop variable-width symbols for a character no label uses. Omitted
+ * deliberately, not forgotten. Dots 34 alone is the EBAE slash (and the "st"
+ * contraction), so mapping it that way would be worse than leaving it blank.
+ */
 const PUNCTUATION: Record<string, number> = {
   " ": BLANK,
   ".": dots(2, 5, 6),
   ",": dots(2),
   "-": dots(3, 6),
-  "/": dots(3, 4),
 };
 
 /**
@@ -70,40 +84,63 @@ export class SimpleBrailleRenderer implements TextLineRenderer {
     const out: number[] = [];
     let numeric = false;
 
+    // An indicator and the cell it marks travel together: emitting one with no
+    // room left for its letter or digit would strand a cell that means nothing
+    // on its own. Stopping a character earlier is the cleaner truncation.
+    const roomForPair = () => out.length + 2 <= cells;
+
     for (const ch of text) {
       if (out.length >= cells) break;
 
       if (ch >= "0" && ch <= "9") {
         if (!numeric) {
+          if (!roomForPair()) break;
           out.push(NUMBER_SIGN);
           numeric = true;
-          if (out.length >= cells) break;
         }
         out.push(LETTERS[DIGITS[Number(ch)]]);
         continue;
       }
 
-      // A decimal point between digits stays inside numeric mode.
+      // A decimal point between digits stays inside numeric mode. A comma does
+      // too in UEB (as a thousands separator); this exits and re-issues the
+      // number sign instead, which is unambiguous but nonstandard. No label
+      // this app emits uses thousands separators.
       if (ch === "." && numeric) {
         out.push(PUNCTUATION["."]);
         continue;
       }
 
-      numeric = false;
-
       const lower = ch.toLowerCase();
-      if (ch !== lower && LETTERS[lower] !== undefined) {
+      const letter = LETTERS[lower];
+
+      if (letter !== undefined && ch !== lower) {
+        // Each capital gets its own dot 6 rather than the UEB capitalized-word
+        // indicator. Correct, if verbose for a run of capitals; axis names are
+        // single letters.
+        numeric = false;
+        if (!roomForPair()) break;
         out.push(CAPITAL_SIGN);
-        if (out.length >= cells) break;
-        out.push(LETTERS[lower]);
+        out.push(letter);
         continue;
       }
 
-      if (LETTERS[lower] !== undefined) {
-        out.push(LETTERS[lower]);
+      if (letter !== undefined) {
+        // a-j share their cells with the digits, so one directly after a digit
+        // would read as another digit ("0.5in" as "0.59n"). UEB marks it with
+        // the grade 1 indicator. k-z cannot be confused with a digit and must
+        // NOT get one. A space has already ended numeric mode by this point,
+        // so only a letter abutting a digit is affected.
+        if (numeric && DIGIT_LETTERS.includes(lower)) {
+          if (!roomForPair()) break;
+          out.push(GRADE_1_SIGN);
+        }
+        numeric = false;
+        out.push(letter);
         continue;
       }
 
+      numeric = false;
       out.push(PUNCTUATION[ch] ?? BLANK);
     }
 

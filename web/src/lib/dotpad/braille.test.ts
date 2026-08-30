@@ -49,4 +49,36 @@ describe("SimpleBrailleRenderer", () => {
   it("renders an unknown character as a blank cell", async () => {
     expect(await r.toCellHex("~", 1)).toBe("00");
   });
+
+  it("marks a letter a-j after a digit with the grade 1 indicator", async () => {
+    // #,0,.,5 then the grade 1 indicator (dots 56 = 0x30), 'i', 'n'.
+    // Without it the 'i' cell reads as the digit 9: "0.59n".
+    expect(await r.toCellHex("0.5in", 7)).toBe("3c1a3211" + "300a" + "1d");
+  });
+
+  it("re-enters numeric mode after a grade 1 marked letter", async () => {
+    // #,1,grade 1,e,#,3 -- the marked letter ended numeric mode.
+    expect(await r.toCellHex("1e3", 6)).toBe("3c01" + "3011" + "3c09");
+  });
+
+  it("does not mark a letter k-z after a digit", async () => {
+    // #,1,2,m,m -- 'm' cannot be confused with a digit, so no indicator.
+    expect(await r.toCellHex("12mm", 5)).toBe("3c0103" + "0d0d");
+  });
+
+  it("does not mark a letter after a space", async () => {
+    // The space already terminated numeric mode, so 'i' needs no indicator.
+    expect(await r.toCellHex("0.5 in", 7)).toBe("3c1a3211" + "00" + "0a1d");
+  });
+
+  it("renders a slash as a blank cell", async () => {
+    // Dots 34 is the EBAE slash, not the UEB one; deliberately unsupported.
+    expect(await r.toCellHex("/", 1)).toBe("00");
+  });
+
+  it("drops a prefix with no room for the letter it marks", async () => {
+    // A lone indicator is meaningless, so truncate one character earlier.
+    expect(await r.toCellHex("Z", 1)).toBe("00");
+    expect(await r.toCellHex("1", 1)).toBe("00");
+  });
 });
