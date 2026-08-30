@@ -275,6 +275,24 @@ can therefore settle out of order and leave a stale label on the text line even
 while the graphic area is correct. In practice the label changes at scrubber
 speed, so this is a narrow window, but it is a real one.
 
+**A large ASCII STL costs far more memory than a binary one of the same
+geometry.** A binary STL is streamed: the main thread posts the `File` itself
+to the worker, which reads it through `file.stream()` and feeds the chunks to
+the Rust `StreamParser`, so the file is never resident anywhere — not in the JavaScript
+heap, not in WASM linear memory. Measured on a 300 MB / 6M-triangle binary STL,
+peak allocation inside WASM drops from 1.72x the file to 0.72x (492 MB to
+206 MB), and the JavaScript-side `ArrayBuffer` — another full copy of the file,
+which the old path also required — is gone entirely. Overall that is 2.72x the
+file down to 0.72x plus one chunk.
+
+An ASCII STL gets none of that. It cannot be parsed incrementally without
+reimplementing `stl_io`'s text reader, so `StreamParser` accumulates the whole
+input and hands it to `parse_stl` at the end; its peak is exactly what it was
+before. This is a deliberate trade: the same geometry costs roughly 5x more
+bytes as text, so nobody ships large ASCII STLs, and every file that has
+actually caused an out-of-memory is binary. If that ever stops being true, the
+fix is a real incremental ASCII reader, not a change to the streaming plumbing.
+
 **Reloading a model briefly holds two meshes.** The worker parses into a
 temporary and only frees the old handle once the new one exists, so a failed
 parse leaves the previously loaded model live and renderable — which matters
@@ -297,7 +315,7 @@ not a detail to be discovered later by whoever tries to publish it.
 ## Manual test plan
 
 **This app has never loaded an STL in a real browser.** Everything above is
-verified by unit tests (123 TypeScript, 70 Rust), by `npm run check`, and by a
+verified by unit tests (141 TypeScript, 90 Rust), by `npm run check`, and by a
 successful production build. Not one of the paths below has been exercised by a
 human. Work through them before trusting any of it.
 

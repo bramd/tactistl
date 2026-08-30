@@ -7,6 +7,11 @@
  * model down with it, leaving an app that says a model is loaded while every
  * render answers "no model is loaded".
  *
+ * The parse is also a streaming one now, and the `StlStream` it feeds is a
+ * WASM heap object: it has to be freed on every path, the failing one
+ * included, or every rejected file leaks its buffer for the life of the page.
+ * That is asserted below alongside the mesh ownership.
+ *
  * `worker.ts` is a module with side effects -- it reads `self` and installs an
  * `onmessage` at import -- so it is driven here the way the browser drives it,
  * through a fake scope, with the WASM module mocked out. The mock is a factory
@@ -36,13 +41,73 @@ class FakeMesh {
   }
 }
 
-/** What the next `parse_stl` call does. Swapped per step below. */
+/** What the next `finish()` does. Swapped per step below. */
 let nextParse: () => FakeMesh = () => new FakeMesh("unset");
+
+/** Every chunk handed to `push`, concatenated, for the last parse. */
+let pushed: number[] = [];
+/** How many `StlStream`s have been constructed and how many freed. */
+let streamsMade = 0;
+let streamsFreed = 0;
+/** The total length each `StlStream` was constructed with. */
+const declaredLengths: number[] = [];
+
+class FakeStream {
+  constructor(totalLen: number) {
+    streamsMade++;
+    declaredLengths.push(totalLen);
+    pushed = [];
+  }
+  push(chunk: Uint8Array): void {
+    pushed.push(...chunk);
+  }
+  finish(): FakeMesh {
+    return nextParse();
+  }
+  free(): void {
+    streamsFreed++;
+  }
+}
 
 vi.mock("../wasm/tactistl_wasm", () => ({
   default: () => Promise.resolve({}),
-  parse_stl: () => nextParse(),
+  StlStream: class {
+    constructor(totalLen: number) {
+      return new FakeStream(totalLen) as unknown as object;
+    }
+  },
 }));
+
+/**
+ * A `File` stand-in that streams `bytes` in small pieces.
+ *
+ * Deliberately more than one chunk: the worker's read loop is the part being
+ * exercised, and a single-chunk fake would pass even if the loop only ever ran
+ * once.
+ */
+function fakeFile(bytes: number[], chunkSize = 3): File {
+  return {
+    name: "model.stl",
+    size: bytes.length,
+    stream() {
+      let at = 0;
+      return {
+        getReader() {
+          return {
+            read() {
+              if (at >= bytes.length) {
+                return Promise.resolve({ done: true, value: undefined });
+              }
+              const value = new Uint8Array(bytes.slice(at, at + chunkSize));
+              at += chunkSize;
+              return Promise.resolve({ done: false, value });
+            },
+          };
+        },
+      };
+    },
+  } as unknown as File;
+}
 
 const replies: GeometryResponse[] = [];
 
@@ -76,18 +141,26 @@ describe("the geometry worker's mesh ownership", () => {
 
   // These run in order against ONE module instance, because the worker's mesh
   // is module state and there is no way to reset it but to load another model.
-  it("loads a model", async () => {
+  it("streams the whole file into the parser and loads the model", async () => {
     nextParse = () => new FakeMesh("first");
-    const reply = await send({ kind: "parse", id: 1, bytes: new ArrayBuffer(4) });
+    const bytes = [1, 2, 3, 4, 5, 6, 7];
+    const reply = await send({ kind: "parse", id: 1, file: fakeFile(bytes) });
     expect(reply).toMatchObject({ id: 1, ok: true, value: 7 });
+    // Every byte arrived, in order, across several chunks -- nothing dropped
+    // at a chunk boundary and nothing fed twice.
+    expect(pushed).toEqual(bytes);
+    // The parser was told the size up front, which is what lets it decide the
+    // format and size its allocation from the first 84 bytes.
+    expect(declaredLengths.at(-1)).toBe(bytes.length);
     expect(freed).toEqual([]);
+    expect(streamsFreed).toBe(streamsMade);
   });
 
   it("leaves the loaded model live and usable when a parse fails", async () => {
     nextParse = () => {
       throw new Error("this does not look like an STL file");
     };
-    const failed = await send({ kind: "parse", id: 2, bytes: new ArrayBuffer(4) });
+    const failed = await send({ kind: "parse", id: 2, file: fakeFile([1, 2, 3]) });
     expect(failed).toEqual({
       id: 2,
       ok: false,
@@ -102,8 +175,41 @@ describe("the geometry worker's mesh ownership", () => {
 
   it("frees the mesh it replaces once a parse succeeds", async () => {
     nextParse = () => new FakeMesh("second");
-    const reply = await send({ kind: "parse", id: 4, bytes: new ArrayBuffer(4) });
+    const reply = await send({ kind: "parse", id: 4, file: fakeFile([1, 2, 3]) });
     expect(reply).toMatchObject({ id: 4, ok: true });
     expect(freed).toEqual(["first"]);
+  });
+
+  /**
+   * The parser is a WASM heap object, and a rejected file is the common case:
+   * the user grabs the wrong thing from a folder they cannot see. If the free
+   * is skipped on that path, every mistaken pick permanently costs whatever
+   * the parser had buffered, because wasm32 memory is never given back.
+   */
+  it("frees the parser on every path, including a failed parse", async () => {
+    expect(streamsFreed).toBe(streamsMade);
+    const before = streamsMade;
+
+    nextParse = () => {
+      throw new Error("this STL contains invalid coordinates");
+    };
+    await send({ kind: "parse", id: 5, file: fakeFile([1, 2, 3]) });
+    expect(streamsMade).toBe(before + 1);
+    expect(streamsFreed).toBe(streamsMade);
+
+    // And when the file itself fails to read, so the throw comes from the
+    // stream rather than from the parser.
+    const broken = {
+      name: "gone.stl",
+      size: 10,
+      stream: () => ({
+        getReader: () => ({
+          read: () => Promise.reject(new Error("the file could not be read")),
+        }),
+      }),
+    } as unknown as File;
+    const reply = await send({ kind: "parse", id: 6, file: broken });
+    expect(reply).toMatchObject({ id: 6, ok: false });
+    expect(streamsFreed).toBe(streamsMade);
   });
 });

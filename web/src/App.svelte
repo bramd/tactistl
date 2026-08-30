@@ -86,9 +86,11 @@
     if (!client || viewer.snapshot().busy) return;
     viewer.setBusy(true);
     try {
-      // `parse` transfers the buffer, so it is read fresh from the File and
-      // never cached: the ArrayBuffer is detached the moment it is posted.
-      const triangles = await client.parse(await file.arrayBuffer());
+      // The `File` goes to the worker untouched: it is structured-cloneable
+      // and disk-backed, so this reads none of it here. The worker streams it
+      // into the parser, which is what keeps a large STL from costing two full
+      // copies of itself in memory.
+      const triangles = await client.parse(file);
       const s = viewer.snapshot();
       const bounds = await client.bounds(
         [s.rotation.x, s.rotation.y, s.rotation.z],

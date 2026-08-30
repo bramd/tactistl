@@ -74,10 +74,74 @@ impl MeshHandle {
 
 /// Parse STL bytes. Rejects with a JS `Error` carrying a human-readable
 /// message suitable for showing in the UI.
+///
+/// Kept for the whole-buffer case and for tests. The app itself uses
+/// `StlStream`, because calling this from JavaScript requires the file to
+/// exist twice — once as the JS `ArrayBuffer` and once as wasm-bindgen's copy
+/// of it into linear memory — and on wasm32 neither copy is ever given back.
 #[wasm_bindgen]
 pub fn parse_stl(bytes: &[u8]) -> Result<MeshHandle, JsError> {
     match mesh::parse_stl(bytes) {
         Ok(mesh) => Ok(MeshHandle { mesh }),
         Err(e) => Err(JsError::new(&e.to_string())),
+    }
+}
+
+/// A chunk-fed STL parser: construct with the file's size, `push` each chunk
+/// of `file.stream()`, then `finish`.
+///
+/// This is a heap object with a `free()`. The caller MUST free it on every
+/// path, failure included — a rejected parse that skips the free leaks its
+/// buffer into linear memory permanently, because wasm32 memory never shrinks.
+#[wasm_bindgen]
+pub struct StlStream {
+    // `Option` so `finish` can take the parser out through `&mut self` rather
+    // than consuming `self`. wasm-bindgen's consumed-self semantics neuter the
+    // JS handle, and the caller then cannot tell whether it still owes a
+    // `free()`; with an `Option` the answer is always "yes, unconditionally".
+    inner: Option<mesh::StreamParser>,
+}
+
+#[wasm_bindgen]
+impl StlStream {
+    /// `total_len` is the file's size in bytes — `File.size`, which costs no
+    /// reading. It arrives as a JS number, i.e. an `f64`, so it is validated
+    /// here rather than being cast into a nonsense `usize`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(total_len: f64) -> Result<StlStream, JsError> {
+        // On wasm32 `usize` is 32-bit, so anything at or above 4 GiB cannot be
+        // a length here at all; and a negative, fractional or non-finite value
+        // is a caller bug, not a file we should try to read.
+        if !total_len.is_finite() || total_len < 0.0 || total_len.fract() != 0.0 {
+            return Err(JsError::new("this STL file could not be read"));
+        }
+        if total_len > usize::MAX as f64 {
+            return Err(JsError::new("this STL file is too large to open"));
+        }
+        Ok(StlStream {
+            inner: Some(mesh::StreamParser::new(total_len as usize)),
+        })
+    }
+
+    /// Feed the next chunk of the file.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), JsError> {
+        let parser = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsError::new("this STL file could not be read"))?;
+        parser.push(chunk).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Take the finished mesh. The stream is spent afterwards, but the handle
+    /// still has to be freed.
+    pub fn finish(&mut self) -> Result<MeshHandle, JsError> {
+        let parser = self
+            .inner
+            .take()
+            .ok_or_else(|| JsError::new("this STL file could not be read"))?;
+        match parser.finish() {
+            Ok(mesh) => Ok(MeshHandle { mesh }),
+            Err(e) => Err(JsError::new(&e.to_string())),
+        }
     }
 }

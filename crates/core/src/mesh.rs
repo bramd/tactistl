@@ -10,7 +10,7 @@ pub struct Mesh {
     pub triangles: Vec<Triangle>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ParseError {
     /// The bytes are not a readable ASCII or binary STL. `detail` is the
     /// underlying technical message; it is kept out of `Display` on purpose,
@@ -79,12 +79,29 @@ impl Mesh {
 /// `None` therefore means both "not a binary STL, treat it as ASCII" and "the
 /// header count is worthless, do not allocate from it".
 fn binary_triangle_count(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 84 {
+    binary_triangle_count_for(bytes, bytes.len())
+}
+
+/// The same rule, for a caller that holds only the first 84 bytes but knows
+/// the file's total length up front — the streaming parser.
+///
+/// Splitting it this way is deliberate: the equality check is the single thing
+/// standing between an attacker-chosen `u32` and a multi-gigabyte
+/// `reserve_exact`, so both callers must run the *same* comparison rather than
+/// two that merely look alike.
+///
+/// For the streaming caller `total_len` is `File.size`, i.e. metadata from the
+/// filesystem rather than a number the file's own bytes chose. It is trusted
+/// exactly as far as the non-streaming caller trusts `bytes.len()`, and if it
+/// turns out to be a lie the parser refuses the file at `finish` for having
+/// delivered the wrong number of bytes.
+fn binary_triangle_count_for(head: &[u8], total_len: usize) -> Option<usize> {
+    if head.len() < 84 || total_len < 84 {
         return None;
     }
-    let n = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+    let n = u32::from_le_bytes(head[80..84].try_into().unwrap()) as usize;
     // Guard the multiply: n comes straight from the file and is untrusted.
-    let exact = n.checked_mul(50).and_then(|b| b.checked_add(84)) == Some(bytes.len());
+    let exact = n.checked_mul(50).and_then(|b| b.checked_add(84)) == Some(total_len);
     exact.then_some(n)
 }
 
@@ -222,23 +239,265 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, ParseError> {
             let p = tri.vertices[i];
             Vec3::new(p[0], p[1], p[2])
         };
-        let t = Triangle { v: [v(0), v(1), v(2)] };
-        // Reject the whole file rather than skipping the offending triangles:
-        // silently dropped geometry is worse than a clear refusal for a tool
-        // whose purpose is trusting the output as a reading of the model.
-        // Only the vertices are checked; `Triangle` does not keep the facet
-        // normal, so a garbage normal cannot reach any downstream maths, and
-        // real exporters do write junk there.
-        if t.v.iter().any(|p| !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite())) {
-            return Err(ParseError::NonFinite);
-        }
-        triangles.push(t);
+        // `checked_triangle` rejects the whole file rather than skipping the
+        // offending triangles: silently dropped geometry is worse than a clear
+        // refusal for a tool whose purpose is trusting the output as a reading
+        // of the model. Only the vertices are checked; `Triangle` does not keep
+        // the facet normal, so a garbage normal cannot reach any downstream
+        // maths, and real exporters do write junk there. The streaming parser
+        // calls the same function, so the two cannot drift apart.
+        triangles.push(checked_triangle([v(0), v(1), v(2)])?);
     }
 
     if triangles.is_empty() {
         return Err(ParseError::NoGeometry);
     }
     Ok(Mesh { triangles })
+}
+
+/// The fixed part of a binary STL: an 80-byte header plus the `u32` count.
+const BINARY_HEADER_LEN: usize = 84;
+/// One binary triangle record: a 3-float normal, three 3-float vertices, and a
+/// 2-byte attribute count.
+const BINARY_RECORD_LEN: usize = 50;
+
+/// Reject the whole file if any vertex coordinate is not finite.
+///
+/// Shared by both parsers so they cannot drift. See `ParseError::NonFinite`
+/// for why this is fatal rather than a skipped triangle: a NaN is *invisible*
+/// downstream, because `f32::min`/`max` ignore a NaN operand and `bounds()`
+/// therefore looks perfectly ordinary over garbage geometry.
+fn checked_triangle(v: [Vec3; 3]) -> Result<Triangle, ParseError> {
+    if v.iter().any(|p| !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite())) {
+        return Err(ParseError::NonFinite);
+    }
+    Ok(Triangle { v })
+}
+
+fn truncated() -> ParseError {
+    // Displays as "this does not look like an STL file, or it is incomplete",
+    // which is exactly the truth for a binary file that stopped early. No new
+    // user-facing string is invented for it.
+    ParseError::Malformed {
+        kind: std::io::ErrorKind::UnexpectedEof,
+        detail: "the STL ended before the triangles its header promised".into(),
+    }
+}
+
+/// What a `StreamParser` is doing with the bytes it is being handed.
+enum StreamState {
+    /// Fewer than 84 bytes have arrived: not yet enough to tell the formats
+    /// apart. At most 83 bytes are held here.
+    Header(Vec<u8>),
+    /// Binary, decided by the verified length rule. `pending` holds the
+    /// fraction of a record carried over a chunk boundary — at most 49 bytes,
+    /// so the buffer never grows with the file.
+    Binary {
+        remaining: usize,
+        pending: Vec<u8>,
+        triangles: Vec<Triangle>,
+    },
+    /// Anything that is not binary-by-length. The whole input is accumulated
+    /// and handed to `parse_stl` at `finish`.
+    ///
+    /// **Known limitation, deliberately accepted:** the memory win of
+    /// streaming does not apply to ASCII STLs — their peak is exactly what it
+    /// was before. An ASCII STL cannot be parsed incrementally without
+    /// reimplementing `stl_io`'s text reader, and it is not worth it: the same
+    /// geometry costs roughly 5x more bytes as text, so nobody ships large
+    /// ASCII STLs, and the files that actually cause an out-of-memory are
+    /// binary.
+    Ascii(Vec<u8>),
+    /// A push already failed. The error is latched and re-reported, so a
+    /// caller that ignores a `push` error can never obtain a partial mesh.
+    Failed(ParseError),
+}
+
+/// A chunk-fed STL parser.
+///
+/// This exists to cut peak memory. `parse_stl` needs the whole file resident
+/// as one `&[u8]`, which in the browser means the file exists twice over — the
+/// JavaScript `ArrayBuffer`, plus wasm-bindgen's copy of it into WASM linear
+/// memory — before a single triangle is read. Neither copy is ever returned to
+/// the browser, because wasm32 memory only grows. Feeding chunks removes both:
+/// the caller streams the `File` from disk and the only long-lived allocation
+/// is the mesh itself.
+///
+/// The total length is required up front (`File.size`, which costs no reading)
+/// and is what makes the format decision — and the exact `reserve_exact` —
+/// possible from the first 84 bytes.
+pub struct StreamParser {
+    total_len: usize,
+    received: usize,
+    state: StreamState,
+}
+
+impl StreamParser {
+    /// `total_len` is the file's size in bytes, known before any of it is read.
+    pub fn new(total_len: usize) -> Self {
+        StreamParser {
+            total_len,
+            received: 0,
+            state: StreamState::Header(Vec::new()),
+        }
+    }
+
+    /// Feed the next chunk. Chunks may be any size, including empty, and need
+    /// not align with anything.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), ParseError> {
+        if let StreamState::Failed(e) = &self.state {
+            return Err(e.clone());
+        }
+        match self.push_inner(chunk) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.state = StreamState::Failed(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    fn push_inner(&mut self, chunk: &[u8]) -> Result<(), ParseError> {
+        self.received = self.received.saturating_add(chunk.len());
+        if self.received > self.total_len {
+            // The file is longer than it said it was. Refuse rather than parse
+            // on: every safety property here rests on the declared length, so
+            // once it is known to be wrong nothing derived from it holds.
+            return Err(ParseError::Malformed {
+                kind: std::io::ErrorKind::InvalidData,
+                detail: "more bytes arrived than the file's length allows".into(),
+            });
+        }
+
+        let mut rest = chunk;
+        if let StreamState::Header(buf) = &mut self.state {
+            let need = BINARY_HEADER_LEN - buf.len();
+            let take = need.min(rest.len());
+            buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if buf.len() < BINARY_HEADER_LEN {
+                return Ok(());
+            }
+            self.state = match binary_triangle_count_for(buf, self.total_len) {
+                Some(n) => StreamState::Binary {
+                    remaining: n,
+                    pending: Vec::with_capacity(BINARY_RECORD_LEN),
+                    // The one allocation that matters, and the reason the
+                    // length rule may not be weakened to an inequality: `n` is
+                    // verified, not merely bounded, so this is exact and
+                    // capped at 0.72x the file.
+                    triangles: {
+                        let mut v = Vec::new();
+                        v.reserve_exact(n);
+                        v
+                    },
+                },
+                None => {
+                    let mut all = std::mem::take(buf);
+                    // Sized from the declared length, not from anything the
+                    // file's own bytes claimed — and the buffer is going to
+                    // reach exactly this size anyway, so this only removes the
+                    // doubling slack rather than committing to anything new.
+                    all.reserve(self.total_len.saturating_sub(all.len()));
+                    StreamState::Ascii(all)
+                }
+            };
+        }
+
+        match &mut self.state {
+            StreamState::Binary { remaining, pending, triangles } => {
+                Self::consume_binary(rest, remaining, pending, triangles)
+            }
+            StreamState::Ascii(buf) => {
+                buf.extend_from_slice(rest);
+                Ok(())
+            }
+            // `Header` returned above; `Failed` was rejected by `push`.
+            _ => Ok(()),
+        }
+    }
+
+    /// Decode whole 50-byte records straight out of `chunk`, keeping only the
+    /// ragged ends. `pending` is topped up first, then the chunk is walked in
+    /// place, then whatever is left over (< 50 bytes) is stashed.
+    fn consume_binary(
+        mut chunk: &[u8],
+        remaining: &mut usize,
+        pending: &mut Vec<u8>,
+        triangles: &mut Vec<Triangle>,
+    ) -> Result<(), ParseError> {
+        if !pending.is_empty() {
+            let need = BINARY_RECORD_LEN - pending.len();
+            let take = need.min(chunk.len());
+            pending.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            if pending.len() == BINARY_RECORD_LEN {
+                let t = Self::decode_record(pending, remaining)?;
+                triangles.push(t);
+                pending.clear();
+            }
+        }
+        while chunk.len() >= BINARY_RECORD_LEN {
+            let (record, tail) = chunk.split_at(BINARY_RECORD_LEN);
+            let t = Self::decode_record(record, remaining)?;
+            triangles.push(t);
+            chunk = tail;
+        }
+        pending.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// One 50-byte record: 12 bytes of facet normal, which is *ignored*
+    /// because `Triangle` does not store it and real exporters write junk
+    /// there; then 36 bytes of vertices; then 2 attribute bytes.
+    fn decode_record(record: &[u8], remaining: &mut usize) -> Result<Triangle, ParseError> {
+        if *remaining == 0 {
+            return Err(ParseError::Malformed {
+                kind: std::io::ErrorKind::InvalidData,
+                detail: "more triangles than the header declared".into(),
+            });
+        }
+        *remaining -= 1;
+        let f = |i: usize| {
+            let at = 12 + i * 4;
+            f32::from_le_bytes(record[at..at + 4].try_into().unwrap())
+        };
+        checked_triangle([
+            Vec3::new(f(0), f(1), f(2)),
+            Vec3::new(f(3), f(4), f(5)),
+            Vec3::new(f(6), f(7), f(8)),
+        ])
+    }
+
+    /// Finish and take the mesh. Errors if the stream ended mid-record, short
+    /// of the declared length, or short of the header's triangle count.
+    pub fn finish(self) -> Result<Mesh, ParseError> {
+        if let StreamState::Failed(e) = self.state {
+            return Err(e);
+        }
+        if self.received != self.total_len {
+            return Err(truncated());
+        }
+        match self.state {
+            StreamState::Failed(e) => Err(e),
+            StreamState::Header(buf) => {
+                // Under 84 bytes in total, so it can never have been binary.
+                // Hand it to the ASCII reader, which is where the empty file
+                // and garbage cases get their existing errors.
+                parse_stl(&buf)
+            }
+            StreamState::Ascii(buf) => parse_stl(&buf),
+            StreamState::Binary { remaining, pending, triangles } => {
+                if remaining != 0 || !pending.is_empty() {
+                    return Err(truncated());
+                }
+                if triangles.is_empty() {
+                    return Err(ParseError::NoGeometry);
+                }
+                Ok(Mesh { triangles })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -477,5 +736,264 @@ mod tests {
     fn poking_a_finite_value_still_parses() {
         let mesh = parse_stl(&poke_float(FIRST_VERTEX_X, 0.5)).unwrap();
         assert_eq!(mesh.triangles.len(), 12);
+    }
+
+    // --- the streaming parser -------------------------------------------
+    //
+    // The property that matters is *equivalence*: whatever `parse_stl` makes
+    // of a byte string, `StreamParser` must make of the same byte string, at
+    // any chunking. Nearly every test below is written as that comparison
+    // rather than against hand-written expectations, because a streaming
+    // parser that merely produces "a plausible mesh" is exactly the bug this
+    // could ship.
+
+    /// Feed `bytes` through a `StreamParser` in `chunk` sized pieces.
+    fn stream_in(bytes: &[u8], chunk: usize) -> Result<Mesh, ParseError> {
+        let mut p = StreamParser::new(bytes.len());
+        for part in bytes.chunks(chunk.max(1)) {
+            p.push(part)?;
+        }
+        p.finish()
+    }
+
+    fn same_mesh(a: &Mesh, b: &Mesh) -> bool {
+        a.triangles.len() == b.triangles.len()
+            && a.triangles.iter().zip(&b.triangles).all(|(x, y)| {
+                x.v.iter()
+                    .zip(y.v.iter())
+                    .all(|(p, q)| p.x == q.x && p.y == q.y && p.z == q.z)
+            })
+    }
+
+    /// Assert that streaming at `chunk` agrees with `parse_stl` exactly,
+    /// including on the error path: an error in one must be an error in the
+    /// other, with the same `Display` text (that text is read aloud).
+    fn assert_agrees(bytes: &[u8], chunk: usize) {
+        match (parse_stl(bytes), stream_in(bytes, chunk)) {
+            (Ok(whole), Ok(streamed)) => assert!(
+                same_mesh(&whole, &streamed),
+                "chunk {chunk}: streamed mesh differs from the whole-file parse"
+            ),
+            (Err(a), Err(b)) => assert_eq!(
+                a.to_string(),
+                b.to_string(),
+                "chunk {chunk}: the two parsers refused the file differently"
+            ),
+            (a, b) => panic!("chunk {chunk}: one parser succeeded and the other did not: {a:?} / {b:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_a_binary_stl_matches_the_whole_file_parse() {
+        for chunk in [1, 7, 49, 50, 51, 83, 84, 85, 128, 1024, BINARY_CUBE.len()] {
+            assert_agrees(BINARY_CUBE, chunk);
+        }
+    }
+
+    /// A byte at a time is the worst case for every boundary at once: the
+    /// header decision, every record split, and the final record's end.
+    #[test]
+    fn a_single_byte_at_a_time_produces_the_same_mesh() {
+        let whole = parse_stl(BINARY_CUBE).unwrap();
+        let streamed = stream_in(BINARY_CUBE, 1).unwrap();
+        assert_eq!(streamed.triangles.len(), 12);
+        assert!(same_mesh(&whole, &streamed));
+        assert_eq!(streamed.bounds().min, Vec3::new(-1.0, -1.0, -1.0));
+        assert_eq!(streamed.bounds().max, Vec3::new(1.0, 1.0, 1.0));
+    }
+
+    /// The format decision needs 84 bytes; make the chunk boundary land in the
+    /// middle of the `u32` count itself, which is the byte range the decision
+    /// actually reads.
+    #[test]
+    fn the_format_is_decided_across_a_chunk_boundary() {
+        for split in [0, 1, 79, 80, 81, 82, 83, 84, 85] {
+            let mut p = StreamParser::new(BINARY_CUBE.len());
+            p.push(&BINARY_CUBE[..split]).unwrap();
+            p.push(&BINARY_CUBE[split..]).unwrap();
+            let mesh = p.finish().unwrap();
+            assert_eq!(mesh.triangles.len(), 12, "split at {split}");
+        }
+    }
+
+    /// A record split across a boundary must be carried, not dropped or
+    /// re-read. Split inside the *vertices* of the second record, where a
+    /// mis-carry would silently shift every later coordinate.
+    #[test]
+    fn a_record_split_across_chunks_is_carried_correctly() {
+        let whole = parse_stl(BINARY_CUBE).unwrap();
+        for split in [84 + 25, 84 + 50 + 20, 84 + 50 * 11 + 30] {
+            let mut p = StreamParser::new(BINARY_CUBE.len());
+            p.push(&BINARY_CUBE[..split]).unwrap();
+            p.push(&BINARY_CUBE[split..]).unwrap();
+            let mesh = p.finish().unwrap();
+            assert!(same_mesh(&whole, &mesh), "split at {split}");
+        }
+    }
+
+    /// The streamed mesh must carry no capacity slack either: on wasm32 that
+    /// slack is never handed back to the browser.
+    #[test]
+    fn a_streamed_binary_stl_allocates_no_spare_triangle_capacity() {
+        let mesh = stream_in(BINARY_CUBE, 997).unwrap();
+        assert_eq!(mesh.triangles.capacity(), mesh.triangles.len());
+    }
+
+    /// The stream stopped early. `File.size` said one thing and the bytes said
+    /// another, so there is no mesh to hand back — the tail triangles would
+    /// simply be missing, which is exactly the silent corruption this tool
+    /// cannot afford.
+    #[test]
+    fn a_truncated_binary_stl_is_refused() {
+        let mut p = StreamParser::new(BINARY_CUBE.len());
+        p.push(&BINARY_CUBE[..BINARY_CUBE.len() - 30]).unwrap();
+        let err = p.finish().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "this does not look like an STL file, or it is incomplete"
+        );
+    }
+
+    /// Truncated at an exact record boundary: the byte count is short but no
+    /// record is half-decoded, so only the count check can catch it.
+    #[test]
+    fn a_binary_stl_short_by_whole_records_is_refused() {
+        let mut p = StreamParser::new(BINARY_CUBE.len());
+        p.push(&BINARY_CUBE[..84 + 50 * 9]).unwrap();
+        assert!(p.finish().is_err());
+    }
+
+    /// The other direction: more bytes arrive than the declared length. Every
+    /// safety property here rests on that length, so the file is refused
+    /// rather than parsed on.
+    #[test]
+    fn more_bytes_than_declared_are_refused() {
+        let mut p = StreamParser::new(BINARY_CUBE.len());
+        p.push(BINARY_CUBE).unwrap();
+        assert!(p.push(&[0u8; 8]).is_err());
+    }
+
+    /// A push failure is latched: a caller that ignores the error from `push`
+    /// must not be able to get a partial mesh out of `finish`.
+    #[test]
+    fn a_failed_push_is_latched_and_finish_still_fails() {
+        let mut b = BINARY_CUBE.to_vec();
+        b[FIRST_VERTEX_X..FIRST_VERTEX_X + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let mut p = StreamParser::new(b.len());
+        let mut errored = false;
+        for part in b.chunks(64) {
+            if p.push(part).is_err() {
+                errored = true;
+            }
+        }
+        assert!(errored, "the NaN was never reported");
+        let err = p.finish().unwrap_err();
+        assert!(matches!(err, ParseError::NonFinite), "got {err:?}");
+    }
+
+    /// The header's count and the file length disagree, so the length rule
+    /// refuses to call it binary at all: the streaming parser reserves nothing
+    /// from the count and falls back to buffering the file for `parse_stl`,
+    /// which is free to make of it whatever the non-streaming path always did.
+    /// What is pinned here is that the two still agree — the fallback must not
+    /// be a second, subtly different reading of the same bytes.
+    #[test]
+    fn a_binary_header_whose_count_disagrees_with_the_length_is_not_streamed() {
+        let mut b = BINARY_CUBE.to_vec();
+        b[80..84].copy_from_slice(&11u32.to_le_bytes());
+        assert_eq!(binary_triangle_count_for(&b[..84], b.len()), None);
+        assert_agrees(&b, 64);
+    }
+
+    /// The invariant, at the streaming entry point: a header claiming billions
+    /// of triangles must not drive an allocation. Asserted on the shared rule,
+    /// because the failure it guards against is an abort, which no test can
+    /// catch.
+    #[test]
+    fn a_lying_triangle_count_yields_no_capacity_to_reserve_when_streaming() {
+        let mut b = BINARY_CUBE.to_vec();
+        b[80..84].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(binary_triangle_count_for(&b[..84], b.len()), None);
+        assert!(stream_in(&b, 64).is_err());
+    }
+
+    #[test]
+    fn streaming_rejects_a_non_finite_coordinate() {
+        for offset in [FIRST_VERTEX_X, LAST_VERTEX_Z] {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let b = poke_float(offset, bad);
+                let err = stream_in(&b, 37).unwrap_err();
+                assert!(matches!(err, ParseError::NonFinite), "got {err:?}");
+                assert_agrees(&b, 37);
+            }
+        }
+    }
+
+    /// ASCII still parses when streamed, via the accumulate-and-delegate
+    /// fallback. Its peak memory is unchanged from before, which is the
+    /// documented limitation.
+    #[test]
+    fn streaming_an_ascii_stl_matches_the_whole_file_parse() {
+        for chunk in [1, 3, 84, 500] {
+            let mesh = stream_in(ASCII_CUBE, chunk).unwrap();
+            assert_eq!(mesh.triangles.len(), 12, "chunk {chunk}");
+            assert_agrees(ASCII_CUBE, chunk);
+        }
+    }
+
+    /// The awkward cases the format sniffing exists for must survive
+    /// streaming too, because the decision is now made from 84 bytes plus a
+    /// declared length rather than from the whole slice.
+    #[test]
+    fn streaming_handles_the_awkward_headers_the_same_way() {
+        let bare = String::from_utf8(ASCII_CUBE.to_vec())
+            .unwrap()
+            .replacen("solid cube\n", "solid\n", 1);
+        assert_agrees(bare.as_bytes(), 13);
+
+        let mut solid_header = BINARY_CUBE.to_vec();
+        solid_header[..6].copy_from_slice(b"solid ");
+        assert_agrees(&solid_header, 13);
+        assert_eq!(stream_in(&solid_header, 13).unwrap().triangles.len(), 12);
+
+        let mut padded = BINARY_CUBE.to_vec();
+        padded[..10].copy_from_slice(b"solidworks");
+        padded.extend_from_slice(&[0u8; 4]);
+        assert_agrees(&padded, 13);
+        assert_eq!(stream_in(&padded, 13).unwrap().triangles.len(), 12);
+    }
+
+    /// The pre-existing refusals must read identically when streamed: these
+    /// strings are announced to the user by a screen reader.
+    #[test]
+    fn streaming_refuses_the_empty_and_garbage_cases_as_before() {
+        for bytes in [
+            b"".as_slice(),
+            b"not an stl file".as_slice(),
+            b"solid empty\nendsolid empty\n".as_slice(),
+        ] {
+            assert!(stream_in(bytes, 4).is_err());
+            assert_agrees(bytes, 4);
+        }
+        assert_eq!(
+            stream_in(b"solid empty\nendsolid empty\n", 4)
+                .unwrap_err()
+                .to_string(),
+            "the file contains no triangles"
+        );
+    }
+
+    /// A zero-length push is legal and must change nothing — a `ReadableStream`
+    /// is entitled to hand one over.
+    #[test]
+    fn empty_chunks_are_harmless() {
+        let mut p = StreamParser::new(BINARY_CUBE.len());
+        p.push(&[]).unwrap();
+        for part in BINARY_CUBE.chunks(100) {
+            p.push(&[]).unwrap();
+            p.push(part).unwrap();
+        }
+        p.push(&[]).unwrap();
+        assert_eq!(p.finish().unwrap().triangles.len(), 12);
     }
 }

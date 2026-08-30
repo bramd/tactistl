@@ -6,7 +6,7 @@
  * thread. The main thread talks to this worker only through `GeometryClient`
  * (`./client.ts`), which correlates replies by `id`.
  */
-import init, { parse_stl, type MeshHandle } from "../wasm/tactistl_wasm";
+import init, { StlStream, type MeshHandle } from "../wasm/tactistl_wasm";
 
 /** A rotation in degrees about the x, y and z axes, applied in that order. */
 export type Rotation = [number, number, number];
@@ -18,13 +18,17 @@ export interface Bounds {
 }
 
 /**
- * Load an STL. The `ArrayBuffer` is transferred, not copied, so the sender's
- * copy is detached once this is posted.
+ * Load an STL.
+ *
+ * The `File` itself is posted, not its bytes. A `File` is structured-cloneable
+ * and stays disk-backed, so cloning it into the worker copies a handle rather
+ * than the data: the file never lands in the JavaScript heap on either side.
+ * The worker streams it in chunks straight into the parser.
  */
 export interface ParseMessage {
   kind: "parse";
   id: number;
-  bytes: ArrayBuffer;
+  file: File;
 }
 
 /** Bounds of the loaded mesh under a rotation and view. */
@@ -115,21 +119,43 @@ async function handle(req: GeometryRequest): Promise<void> {
     await ensureReady();
     switch (req.kind) {
       case "parse": {
-        // Parse into a temporary, and only free the old handle once the new
-        // one exists. A failed parse therefore throws before anything is
-        // released, leaving the previously loaded model live and renderable.
+        // Stream the file into the parser instead of handing WASM one big
+        // slice. A `parse_stl(bytes)` call needs the whole file resident twice
+        // over -- the JS buffer plus wasm-bindgen's copy into linear memory --
+        // and wasm32 memory is never returned to the browser, so both copies
+        // are a permanent cost. Chunks cost one chunk.
         //
-        // The cost is deliberate: on the SUCCESS path both meshes are briefly
-        // resident, and wasm32 linear memory only ever grows, so the module's
-        // high-water mark is set by the largest pair rather than the largest
-        // single mesh and never comes back down. Freeing first would avoid
-        // that, at the price of destroying the loaded model every time a parse
-        // fails -- and this app exists for a user who cannot glance at a file
-        // picker to check they grabbed the right file. An app that survives a
-        // fumbled selection is worth more than a lower ceiling, and print STLs
-        // run to tens of megabytes, not hundreds.
-        const parsed = parse_stl(new Uint8Array(req.bytes));
-        // Past the throwing call: from here the swap cannot fail partway.
+        // `StlStream` is a WASM heap object, so it must be freed on EVERY
+        // path. The `finally` covers a rejected parse and a stream that throws
+        // mid-read; without it each refused file would leak its buffer for the
+        // lifetime of the page.
+        const parser = new StlStream(req.file.size);
+        let parsed: MeshHandle;
+        try {
+          const reader = req.file.stream().getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            parser.push(value);
+          }
+          // Parse into a temporary, and only free the old handle once the new
+          // one exists. A failed parse therefore throws before anything is
+          // released, leaving the previously loaded model live and renderable.
+          //
+          // The cost is deliberate: on the SUCCESS path both meshes are
+          // briefly resident, and wasm32 linear memory only ever grows, so the
+          // module's high-water mark is set by the largest pair rather than
+          // the largest single mesh and never comes back down. Freeing first
+          // would avoid that, at the price of destroying the loaded model every
+          // time a parse fails -- and this app exists for a user who cannot
+          // glance at a file picker to check they grabbed the right file. An
+          // app that survives a fumbled selection is worth more than a lower
+          // ceiling.
+          parsed = parser.finish();
+        } finally {
+          parser.free();
+        }
+        // Past the throwing calls: from here the swap cannot fail partway.
         const previous = mesh;
         mesh = parsed;
         previous?.free();

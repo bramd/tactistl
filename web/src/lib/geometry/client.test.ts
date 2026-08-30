@@ -31,6 +31,15 @@ class FakeWorker implements WorkerLike {
   }
 }
 
+/**
+ * A stand-in for a `File`. The client only posts it on; nothing here reads it,
+ * so a plain object with a size is enough and keeps these tests independent of
+ * the Node version's `File` support.
+ */
+function fakeFile(size: number): File {
+  return { name: "model.stl", size } as unknown as File;
+}
+
 function setup() {
   const worker = new FakeWorker();
   const client = new GeometryClient(() => worker);
@@ -40,24 +49,31 @@ function setup() {
 describe("GeometryClient", () => {
   it("resolves the promise matching the response id", async () => {
     const { worker, client } = setup();
-    const p = client.parse(new ArrayBuffer(8));
+    const p = client.parse(fakeFile(8));
     expect(worker.posted).toHaveLength(1);
     worker.respond({ id: worker.posted[0].id, ok: true, value: 42 });
     await expect(p).resolves.toBe(42);
   });
 
-  it("transfers the buffer rather than copying it", async () => {
+  it("posts the File itself, transferring nothing", async () => {
+    // The File is structured-cloned, not transferred. That is the whole point:
+    // a transfer detaches the caller's object, and reading the file into an
+    // ArrayBuffer to send instead would put the entire STL in the JS heap --
+    // the copy this design exists to avoid. The caller must be able to keep
+    // using the File afterwards.
     const { worker, client } = setup();
-    const bytes = new ArrayBuffer(8);
-    const p = client.parse(bytes);
-    expect(worker.transfers[0]).toEqual([bytes]);
+    const file = fakeFile(8);
+    const p = client.parse(file);
+    expect(worker.posted[0]).toMatchObject({ kind: "parse", file });
+    expect(worker.transfers[0]).toBeUndefined();
     worker.respond({ id: worker.posted[0].id, ok: true, value: 1 });
     await p;
+    expect(file.size).toBe(8);
   });
 
   it("settles two concurrent requests independently and in the right pairing", async () => {
     const { worker, client } = setup();
-    const a = client.parse(new ArrayBuffer(4));
+    const a = client.parse(fakeFile(4));
     const b = client.bounds([0, 0, 0], 0);
     const [idA, idB] = worker.posted.map((r) => r.id);
     expect(idA).not.toBe(idB);
@@ -78,8 +94,8 @@ describe("GeometryClient", () => {
 
   it("does not settle other promises when one response arrives", async () => {
     const { worker, client } = setup();
-    const a = client.parse(new ArrayBuffer(4));
-    const b = client.parse(new ArrayBuffer(4));
+    const a = client.parse(fakeFile(4));
+    const b = client.parse(fakeFile(4));
     worker.respond({ id: worker.posted[0].id, ok: true, value: 1 });
     await expect(a).resolves.toBe(1);
     expect(client.pendingCount).toBe(1);
@@ -89,7 +105,7 @@ describe("GeometryClient", () => {
 
   it("rejects with the worker's message text when ok is false", async () => {
     const { worker, client } = setup();
-    const p = client.parse(new ArrayBuffer(4));
+    const p = client.parse(fakeFile(4));
     worker.respond({
       id: worker.posted[0].id,
       ok: false,
@@ -102,7 +118,7 @@ describe("GeometryClient", () => {
 
   it("ignores a response with an unknown id without throwing", async () => {
     const { worker, client } = setup();
-    const p = client.parse(new ArrayBuffer(4));
+    const p = client.parse(fakeFile(4));
     expect(() => worker.respond({ id: 9999, ok: true, value: 1 })).not.toThrow();
     expect(client.pendingCount).toBe(1);
     worker.respond({ id: worker.posted[0].id, ok: true, value: 5 });
@@ -111,7 +127,7 @@ describe("GeometryClient", () => {
 
   it("ignores a second response for an id that already settled", async () => {
     const { worker, client } = setup();
-    const p = client.parse(new ArrayBuffer(4));
+    const p = client.parse(fakeFile(4));
     const id = worker.posted[0].id;
     worker.respond({ id, ok: true, value: 3 });
     await expect(p).resolves.toBe(3);
@@ -120,7 +136,7 @@ describe("GeometryClient", () => {
 
   it("does not retain settled entries", async () => {
     const { worker, client } = setup();
-    const a = client.parse(new ArrayBuffer(4));
+    const a = client.parse(fakeFile(4));
     const b = client.render({
       rotation: [0, 0, 0],
       view: 0,
@@ -143,7 +159,7 @@ describe("GeometryClient", () => {
 
   it("does not retain an entry it rejected", async () => {
     const { worker, client } = setup();
-    const p = client.parse(new ArrayBuffer(4));
+    const p = client.parse(fakeFile(4));
     worker.respond({ id: worker.posted[0].id, ok: false, error: "nope" });
     await expect(p).rejects.toThrow("nope");
     expect(client.pendingCount).toBe(0);
@@ -198,7 +214,7 @@ describe("GeometryClient", () => {
 
   it("terminates the worker and rejects everything in flight on dispose", async () => {
     const { worker, client } = setup();
-    const p = client.parse(new ArrayBuffer(4));
+    const p = client.parse(fakeFile(4));
     client.dispose();
     expect(worker.terminated).toBe(1);
     await expect(p).rejects.toThrow(/disposed/i);
@@ -208,13 +224,13 @@ describe("GeometryClient", () => {
   it("rejects requests made after dispose", async () => {
     const { client } = setup();
     client.dispose();
-    await expect(client.parse(new ArrayBuffer(4))).rejects.toThrow(/disposed/i);
+    await expect(client.parse(fakeFile(4))).rejects.toThrow(/disposed/i);
     await expect(client.bounds([0, 0, 0], 0)).rejects.toThrow(/disposed/i);
   });
 
   it("disposes only once", async () => {
     const { worker, client } = setup();
-    const p = client.parse(new ArrayBuffer(4));
+    const p = client.parse(fakeFile(4));
     client.dispose();
     client.dispose();
     expect(worker.terminated).toBe(1);
@@ -226,7 +242,7 @@ describe("GeometryClient", () => {
     const factory = vi.fn(() => worker);
     const client = new GeometryClient(factory);
     expect(factory).not.toHaveBeenCalled();
-    const a = client.parse(new ArrayBuffer(4));
+    const a = client.parse(fakeFile(4));
     expect(factory).toHaveBeenCalledTimes(1);
     const b = client.bounds([0, 0, 0], 0);
     expect(factory).toHaveBeenCalledTimes(1);

@@ -77,15 +77,15 @@ export class GeometryClient {
   /**
    * Load an STL and return its triangle count.
    *
-   * `bytes` is TRANSFERRED, not copied: a 50 MB STL is worth not duplicating,
-   * but the caller's buffer is detached and unusable afterwards. Read the
-   * `File` again to re-parse; do not cache the `ArrayBuffer`.
+   * The `File` is posted as-is. It is structured-cloneable and stays
+   * disk-backed, so nothing is read here and nothing is transferred: the
+   * caller keeps a perfectly usable `File` afterwards, and the worker streams
+   * the bytes into WASM a chunk at a time. Do not call `arrayBuffer()` on the
+   * caller's behalf -- that materialises the whole file in the JS heap, which
+   * is exactly the cost this avoids.
    */
-  parse(bytes: ArrayBuffer): Promise<number> {
-    return this.request<number>(
-      (id) => ({ kind: "parse", id, bytes }),
-      [bytes],
-    );
+  parse(file: File): Promise<number> {
+    return this.request<number>((id) => ({ kind: "parse", id, file }));
   }
 
   /** The bounds of the loaded mesh under this rotation and view. */
@@ -134,10 +134,7 @@ export class GeometryClient {
     }
   }
 
-  private request<T>(
-    build: (id: number) => GeometryRequest,
-    transfer?: Transferable[],
-  ): Promise<T> {
+  private request<T>(build: (id: number) => GeometryRequest): Promise<T> {
     if (this.disposed) {
       return Promise.reject(new Error("the geometry worker was disposed"));
     }
@@ -149,10 +146,13 @@ export class GeometryClient {
         reject,
       });
       try {
-        worker.postMessage(build(id), transfer);
+        worker.postMessage(build(id));
       } catch (e) {
-        // A synchronous postMessage failure (a detached buffer, say) would
-        // otherwise leave the entry pending forever.
+        // A synchronous postMessage failure -- a value that will not
+        // structured-clone, say -- would otherwise leave the entry pending
+        // forever. Nothing is transferred in this direction any more: the
+        // `File` a parse carries is cloned, not detached, so the caller's
+        // reference stays usable.
         this.pending.delete(id);
         reject(e instanceof Error ? e : new Error(String(e)));
       }
