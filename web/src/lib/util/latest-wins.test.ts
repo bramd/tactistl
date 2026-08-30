@@ -56,17 +56,25 @@ describe("LatestWinsQueue", () => {
     expect(q.busy).toBe(false);
   });
 
-  it("keeps running after a send rejects", async () => {
+  it("returns to idle after a send rejects, then runs the next item in a fresh cycle", async () => {
     let calls = 0;
     const sent: number[] = [];
+    const errors: unknown[] = [];
     const q = new LatestWinsQueue<number>(async (n) => {
       calls++;
       if (calls === 1) throw new Error("transport blew up");
       sent.push(n);
-    });
+    }, (e) => errors.push(e));
     q.submit(1);
     await Promise.resolve();
     await Promise.resolve();
+    // Assert recovery BEFORE submitting again. Without this the test passes
+    // even if the queue never recovered: item 2 would be picked up by
+    // coalescing inside the still-running first pump, which proves nothing
+    // about recovery.
+    expect(errors).toHaveLength(1);
+    expect(q.busy).toBe(false);
+
     q.submit(2);
     await Promise.resolve();
     await Promise.resolve();
