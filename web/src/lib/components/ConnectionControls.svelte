@@ -113,16 +113,24 @@
       Diagnostic, deliberately NOT announced: connecting already fires the live
       region, and a second announcement on the same action would be noise. This
       is plain static text, here to be read on demand.
+
+      Behind a native <details> so it is collapsed out of the main flow but
+      stays reachable. No role or aria-expanded is added: the browser already
+      exposes the disclosure state, and hand-written ARIA on these two elements
+      degrades it in several screen readers.
     -->
-    {#if deviceName}
-      <p>
-        Device: {deviceName}{bufferMode
-          ? ` — sends ${BUFFER_MODES[bufferMode]}`
-          : ""}.
-      </p>
-    {:else}
-      <p>Device: this one did not report a model name.</p>
-    {/if}
+    <details>
+      <summary>Device details</summary>
+      {#if deviceName}
+        <p>
+          Device: {deviceName}{bufferMode
+            ? ` — sends ${BUFFER_MODES[bufferMode]}`
+            : ""}.
+        </p>
+      {:else}
+        <p>Device: this one did not report a model name.</p>
+      {/if}
+    </details>
     <button type="button" bind:this={disconnectButton} onclick={ondisconnect}>
       Disconnect from the Dot Pad over {active ? NAMES[active] : "this link"}
     </button>

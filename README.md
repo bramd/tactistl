@@ -167,8 +167,12 @@ public API to override the choice, and the app does not try to. Note this is a
 cell type from an overlapping but not identical model list.
 
 To check which strategy a given unit gets, connect it: the connection section
-now shows the name the device reported and the resulting strategy, e.g.
-"Device: DotPad320X — sends several display regions per packet". The SDK asks
+carries a "Device details" disclosure, collapsed by default, holding the name
+the device reported and the resulting strategy, e.g.
+"Device: DotPad320X — sends several display regions per packet". It is
+diagnostic, so it stays out of the main flow and out of the live region — the
+connection announcement already fires — but a native `<details>` keeps it one
+keystroke away for a screen-reader user. The SDK asks
 for the name during its own connection handshake, so the sink reads it out of
 the message callback rather than requesting it again. The strategy shown is
 **derived** by re-running the SDK's own substring rule (`expectedBufferModeForName`
