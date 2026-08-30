@@ -35,5 +35,16 @@
    * as a root file, and an `import ... from "./vendor/DotPadSDK-3.0.2"`
    * resolves to that `.d.ts` rather than the excluded `.js`.
    */
-  "exclude": ["src/lib/wasm", "src/lib/dotpad/vendor/*.js"]
+  /**
+   * `version-pin.test.ts` reads the vendored SDK off disk with `node:fs`, so it
+   * needs Node types. Rather than add "node" to this project's `types` -- which
+   * would let browser code reference `process`/`Buffer` and typecheck, then
+   * break in the browser -- it is checked by `tsconfig.node.json`, which
+   * already has them. `npm run check` runs both projects, so it stays covered.
+   */
+  "exclude": [
+    "src/lib/wasm",
+    "src/lib/dotpad/vendor/*.js",
+    "src/lib/dotpad/vendor/version-pin.test.ts"
+  ]
 }

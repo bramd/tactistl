@@ -53,7 +53,16 @@ export declare class DotPadSDK {
     inputData: string,
     device?: DotDevice | null,
     displayMode?: DisplayModeValue,
-    needsTranslation?: boolean,
+    /**
+     * Deliberately narrowed to `false`. The SDK supports braille translation,
+     * but passing `true` dynamically imports `./lib/liblouis.js` -- assets we
+     * do not ship (13.7 MB of `.data` alone, plus the LGPL relinking
+     * obligations that come with redistributing them). That failure would be
+     * green at compile time and blow up at RUNTIME, mid device interaction,
+     * so the type makes it unrepresentable instead. We translate the short
+     * axis labels this app emits with our own minimal table in `../braille.ts`.
+     */
+    needsTranslation?: false,
   ): Promise<void>;
   displayAllDown(device?: DotDevice | null): void;
   setCallBack(
